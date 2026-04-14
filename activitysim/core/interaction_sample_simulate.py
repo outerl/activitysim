@@ -31,6 +31,7 @@ def _interaction_sample_simulate(
     trace_choice_name,
     estimator,
     skip_choice=False,
+    want_probs=False,
     *,
     chunk_sizer: chunk.ChunkSizer,
     compute_settings: ComputeSettings | None = None,
@@ -327,6 +328,15 @@ def _interaction_sample_simulate(
             # FIXME this is kind of gnarly, but we force choice of first alt
             probs.loc[zero_probs, 0] = 1.0
 
+    if want_probs:
+        # Return the raw components needed to reconstruct per-alternative probabilities:
+        #   first_row_offsets / last_row_offsets: per-chooser row slices into the
+        #   sparse alternatives ordering; probs: padded 2-D probability DataFrame
+        #   (rows = choosers, cols = 0..max_sample_count-1).
+        prob_data = (first_row_offsets, last_row_offsets, probs)
+    else:
+        prob_data = None
+
     if skip_choice:
         return choosers.join(logsums.to_frame("logsums"))
 
@@ -395,6 +405,8 @@ def _interaction_sample_simulate(
         # handing this off to our caller
         chunk_sizer.log_df(trace_label, "choices", None)
 
+        if want_probs:
+            return choices, prob_data
         return choices
 
 
@@ -416,6 +428,7 @@ def interaction_sample_simulate(
     trace_choice_name=None,
     estimator=None,
     skip_choice=False,
+    want_probs=False,
     explicit_chunk_size=0,
     *,
     compute_settings: ComputeSettings | None = None,
@@ -500,7 +513,7 @@ def interaction_sample_simulate(
         chunk_size=chunk_size,
         explicit_chunk_size=explicit_chunk_size,
     ):
-        choices = _interaction_sample_simulate(
+        chunk_result = _interaction_sample_simulate(
             state,
             chooser_chunk,
             alternative_chunk,
@@ -516,20 +529,28 @@ def interaction_sample_simulate(
             trace_choice_name,
             estimator,
             skip_choice,
+            want_probs=want_probs,
             chunk_sizer=chunk_sizer,
             compute_settings=compute_settings,
         )
 
-        result_list.append(choices)
+        result_list.append(chunk_result)
 
         chunk_sizer.log_df(trace_label, f"result_list", result_list)
 
     # FIXME: this will require 2X RAM
     # if necessary, could append to hdf5 store on disk:
     # http://pandas.pydata.org/pandas-docs/stable/io.html#id2
-    if len(result_list) > 1:
-        choices = pd.concat(result_list)
-
-    assert len(choices.index == len(choosers.index))
-
-    return choices
+    if want_probs:
+        choices_list = [r[0] for r in result_list]
+        prob_data_list = [r[1] for r in result_list]
+        choices = pd.concat(choices_list) if len(choices_list) > 1 else choices_list[0]
+        # For a single chunk (typical notebook use): return the tuple directly.
+        # For multiple chunks: return a list of (first_row_offsets, last_row_offsets, probs) tuples.
+        prob_data = prob_data_list[0] if len(prob_data_list) == 1 else prob_data_list
+        assert len(choices.index == len(choosers.index))
+        return choices, prob_data
+    else:
+        choices = pd.concat(result_list) if len(result_list) > 1 else result_list[0]
+        assert len(choices.index == len(choosers.index))
+        return choices

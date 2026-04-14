@@ -781,6 +781,7 @@ def run_destination_simulate(
     chunk_size,
     trace_label,
     skip_choice=False,
+    want_probs=False,
 ):
     """
     run destination_simulate on tour_destination_sample
@@ -900,14 +901,20 @@ def run_destination_simulate(
         trace_choice_name="destination",
         estimator=estimator,
         skip_choice=skip_choice,
+        want_probs=want_probs,
         compute_settings=model_settings.compute_settings,
     )
+
+    if want_probs:
+        choices, prob_data = choices  # prob_data = (first_row_offsets, last_row_offsets, probs)
 
     if not want_logsums:
         # for consistency, always return a dataframe with canonical column name
         assert isinstance(choices, pd.Series)
         choices = choices.to_frame("choice")
 
+    if want_probs:
+        return choices, prob_data
     return choices
 
 
