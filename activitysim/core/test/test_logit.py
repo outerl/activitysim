@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os.path
 import re
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -506,8 +507,11 @@ def test_make_choices_eet_nl(monkeypatch):
     }
     alt_order_array = np.array(["walk", "car", "bus"])
 
+    state = workflow.State().default_settings()
+    state.settings.nested_explicit_error_term_method = "tree_walk"
+
     choices = logit.make_choices_explicit_error_term_nl(
-        workflow.State().default_settings(),
+        state,
         pd.DataFrame(
             [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
             index=[10, 11],
@@ -586,6 +590,8 @@ def test_make_choices_vs_eet_same_distribution():
             return eet_rng.gumbel(size=(len(df), n))
 
     class EETDummyState:
+        settings = SimpleNamespace(nested_explicit_error_term_method="tree_walk")
+
         @staticmethod
         def get_rn_generator():
             return EETDummyRNG()
@@ -667,6 +673,8 @@ def test_make_choices_vs_eet_nl_same_distribution():
             return eet_rng.gumbel(size=(len(df), n))
 
     class EETDummyState:
+        settings = SimpleNamespace(nested_explicit_error_term_method="tree_walk")
+
         @staticmethod
         def get_rn_generator():
             return EETDummyRNG()
@@ -700,6 +708,1106 @@ def test_make_choices_vs_eet_nl_same_distribution():
 
     # They should be close
     np.testing.assert_allclose(mc_fracs, eet_fracs, atol=a_tol)
+
+
+def _repeated_utility_df(raw_utilities: pd.Series, n_draws: int) -> pd.DataFrame:
+    raw_utilities = pd.Series(raw_utilities, dtype=float)
+    return pd.DataFrame(
+        np.repeat(raw_utilities.to_numpy()[None, :], n_draws, axis=0),
+        columns=raw_utilities.index,
+        index=pd.RangeIndex(n_draws, name="chooser_id"),
+    )
+
+
+def _make_rng_state(
+    df: pd.DataFrame,
+    seed: int,
+    step_name: str,
+    nested_method: str | None = None,
+) -> workflow.State:
+    state = workflow.State().default_settings()
+    if nested_method is not None:
+        state.settings.nested_explicit_error_term_method = nested_method
+    rng = state.get_rn_generator()
+    rng.set_base_seed(seed)
+    rng.add_channel(df.index.name, df)
+    rng.begin_step(step_name)
+    return state
+
+
+def _finish_rng_state(state: workflow.State, step_name: str) -> None:
+    state.get_rn_generator().end_step(step_name)
+
+
+def _choice_shares(choices: pd.Series, alt_order_array: np.ndarray) -> pd.Series:
+    counts = np.bincount(choices.to_numpy(dtype=int), minlength=len(alt_order_array))
+    return pd.Series(counts / counts.sum(), index=alt_order_array)
+
+
+def _expected_nested_logit_shares(
+    raw_utilities: pd.Series,
+    nest_spec: dict,
+    alt_order_array: np.ndarray,
+    seed: int = 42,
+) -> pd.Series:
+    raw_df = _repeated_utility_df(raw_utilities.reindex(alt_order_array), n_draws=1)
+    step_name = f"expected_nested_logit_{len(alt_order_array)}"
+    state = _make_rng_state(raw_df, seed=seed, step_name=step_name)
+    try:
+        nested_exp_utilities = simulate.compute_nested_exp_utilities(raw_df, nest_spec)
+        nested_probabilities = simulate.compute_nested_probabilities(
+            state, nested_exp_utilities, nest_spec, trace_label=None
+        )
+        base_probabilities = simulate.compute_base_probabilities(
+            nested_probabilities, nest_spec, raw_df
+        )
+    finally:
+        _finish_rng_state(state, step_name)
+
+    return base_probabilities.iloc[0].reindex(alt_order_array)
+
+
+def _nested_logit_eet_shares(
+    raw_utilities: pd.Series,
+    nest_spec: dict,
+    alt_order_array: np.ndarray,
+    method: str,
+    n_draws: int,
+    seed: int = 42,
+) -> pd.Series:
+    raw_df = _repeated_utility_df(
+        raw_utilities.reindex(alt_order_array), n_draws=n_draws
+    )
+    step_name = f"nested_eet_{method}_{n_draws}_{len(alt_order_array)}"
+    state = _make_rng_state(
+        raw_df, seed=seed, step_name=step_name, nested_method=method
+    )
+    try:
+        nested_utilities = simulate.compute_nested_utilities(raw_df, nest_spec)
+        choices = logit.make_choices_explicit_error_term_nl(
+            state,
+            nested_utilities,
+            alt_order_array,
+            nest_spec,
+            trace_label=None,
+        )
+    finally:
+        _finish_rng_state(state, step_name)
+
+    return _choice_shares(choices, alt_order_array)
+
+
+def _nested_logit_mc_shares(
+    raw_utilities: pd.Series,
+    nest_spec: dict,
+    alt_order_array: np.ndarray,
+    n_draws: int,
+    seed: int = 42,
+) -> pd.Series:
+    raw_df = _repeated_utility_df(
+        raw_utilities.reindex(alt_order_array), n_draws=n_draws
+    )
+    step_name = f"nested_mc_{n_draws}_{len(alt_order_array)}"
+    state = _make_rng_state(raw_df, seed=seed, step_name=step_name)
+    try:
+        nested_exp_utilities = simulate.compute_nested_exp_utilities(raw_df, nest_spec)
+        nested_probabilities = simulate.compute_nested_probabilities(
+            state, nested_exp_utilities, nest_spec, trace_label=None
+        )
+        base_probabilities = simulate.compute_base_probabilities(
+            nested_probabilities, nest_spec, raw_df
+        )
+        choices, _ = logit.make_choices(state, base_probabilities, trace_label=None)
+    finally:
+        _finish_rng_state(state, step_name)
+
+    return _choice_shares(choices, alt_order_array)
+
+
+def _assert_empirical_shares_close(
+    observed: pd.Series,
+    expected: pd.Series,
+    n_draws: int,
+    sigma_multiplier: float = 6.0,
+    variance_floor: float = 0.02,
+) -> None:
+    expected = expected.reindex(observed.index)
+    tolerances = sigma_multiplier * np.sqrt(
+        np.maximum(expected * (1.0 - expected), variance_floor) / n_draws
+    )
+    differences = (observed - expected).abs()
+    assert (differences <= tolerances).all(), pd.DataFrame(
+        {
+            "observed": observed,
+            "expected": expected,
+            "abs_diff": differences,
+            "tolerance": tolerances,
+        }
+    ).to_string()
+
+
+def _nested_logit_method_share_matrix(
+    raw_utilities: pd.Series,
+    nest_spec: dict,
+    alt_order_array: np.ndarray,
+    method: str,
+    n_draws: int,
+    seeds: list[int],
+) -> np.ndarray:
+    share_samples = []
+    for seed in seeds:
+        if method == "mc":
+            shares = _nested_logit_mc_shares(
+                raw_utilities,
+                nest_spec,
+                alt_order_array,
+                n_draws=n_draws,
+                seed=seed,
+            )
+        else:
+            shares = _nested_logit_eet_shares(
+                raw_utilities,
+                nest_spec,
+                alt_order_array,
+                method=method,
+                n_draws=n_draws,
+                seed=seed,
+            )
+        share_samples.append(shares.reindex(alt_order_array).to_numpy())
+
+    return np.vstack(share_samples)
+
+
+def _assert_average_empirical_shares_close(
+    observed_matrix: np.ndarray,
+    expected: pd.Series,
+    n_draws: int,
+    sigma_multiplier: float = 6.0,
+    variance_floor: float = 0.02,
+) -> None:
+    expected = expected.astype(float)
+    mean_observed = pd.Series(observed_matrix.mean(axis=0), index=expected.index)
+    effective_draws = n_draws * observed_matrix.shape[0]
+    tolerances = sigma_multiplier * np.sqrt(
+        np.maximum(expected * (1.0 - expected), variance_floor) / effective_draws
+    )
+    differences = (mean_observed - expected).abs()
+    assert (differences <= tolerances).all(), pd.DataFrame(
+        {
+            "mean_observed": mean_observed,
+            "expected": expected,
+            "abs_diff": differences,
+            "tolerance": tolerances,
+        }
+    ).to_string()
+
+
+def _assert_average_share_deltas_close(
+    baseline_matrix: np.ndarray,
+    perturbed_matrix: np.ndarray,
+    baseline_expected: pd.Series,
+    perturbed_expected: pd.Series,
+    n_draws: int,
+    sigma_multiplier: float = 6.0,
+    variance_floor: float = 0.02,
+) -> None:
+    observed_delta = pd.Series(
+        perturbed_matrix.mean(axis=0) - baseline_matrix.mean(axis=0),
+        index=baseline_expected.index,
+    )
+    expected_delta = perturbed_expected - baseline_expected
+    effective_draws = n_draws * baseline_matrix.shape[0]
+    variances = (
+        np.maximum(baseline_expected * (1.0 - baseline_expected), variance_floor)
+        + np.maximum(perturbed_expected * (1.0 - perturbed_expected), variance_floor)
+    ) / effective_draws
+    tolerances = sigma_multiplier * np.sqrt(variances)
+    differences = (observed_delta - expected_delta).abs()
+    assert (differences <= tolerances).all(), pd.DataFrame(
+        {
+            "observed_delta": observed_delta,
+            "expected_delta": expected_delta,
+            "abs_diff": differences,
+            "tolerance": tolerances,
+        }
+    ).to_string()
+
+
+def _assert_nested_logit_methods_match_expected_across_seeds(
+    raw_utilities: pd.Series,
+    nest_spec: dict,
+    alt_order_array: np.ndarray,
+    n_draws: int,
+    seeds: list[int],
+    methods: tuple[str, ...] = ("mc", "tree_walk", "exact_leaf"),
+) -> dict[str, np.ndarray]:
+    expected = _expected_nested_logit_shares(raw_utilities, nest_spec, alt_order_array)
+    share_matrices: dict[str, np.ndarray] = {}
+    for method in methods:
+        share_matrix = _nested_logit_method_share_matrix(
+            raw_utilities,
+            nest_spec,
+            alt_order_array,
+            method=method,
+            n_draws=n_draws,
+            seeds=seeds,
+        )
+        _assert_average_empirical_shares_close(share_matrix, expected, n_draws=n_draws)
+        share_matrices[method] = share_matrix
+
+    for i, left_method in enumerate(methods):
+        for right_method in methods[i + 1 :]:
+            left_mean = pd.Series(
+                share_matrices[left_method].mean(axis=0), index=alt_order_array
+            )
+            right_mean = pd.Series(
+                share_matrices[right_method].mean(axis=0), index=alt_order_array
+            )
+            tolerances = 8.0 * np.sqrt(
+                2.0
+                * np.maximum(expected * (1.0 - expected), 0.02)
+                / (n_draws * len(seeds))
+            )
+            differences = (left_mean - right_mean).abs()
+            assert (differences <= tolerances).all(), pd.DataFrame(
+                {
+                    "left_method": left_method,
+                    "right_method": right_method,
+                    "left_mean": left_mean,
+                    "right_mean": right_mean,
+                    "abs_diff": differences,
+                    "tolerance": tolerances,
+                }
+            ).to_string()
+
+    return share_matrices
+
+
+def _rmse(values: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(values))))
+
+
+def _estimate_power_law_slope(draw_counts: np.ndarray, errors: np.ndarray) -> float:
+    clipped_errors = np.clip(errors.astype(float), np.finfo(float).eps, None)
+    slope, _intercept = np.polyfit(
+        np.log(draw_counts.astype(float)), np.log(clipped_errors), deg=1
+    )
+    return float(slope)
+
+
+def _assert_three_level_nested_logit_methods_follow_power_law(
+    draw_counts: np.ndarray,
+    seeds: list[int],
+    slope_lower: float = -0.8,
+    slope_upper: float = -0.2,
+    pair_slope_lower: float | None = None,
+    pair_slope_upper: float | None = None,
+    max_final_method_error: float | None = None,
+    max_final_pair_error: float | None = None,
+) -> None:
+    if pair_slope_lower is None:
+        pair_slope_lower = slope_lower
+    if pair_slope_upper is None:
+        pair_slope_upper = slope_upper
+
+    method_names = ["mc", "tree_walk", "exact_leaf"]
+    pair_names = [
+        ("mc", "tree_walk"),
+        ("mc", "exact_leaf"),
+        ("tree_walk", "exact_leaf"),
+    ]
+
+    nest_spec = {
+        "name": "root",
+        "coefficient": 1.0,
+        "alternatives": [
+            {
+                "name": "AUTO",
+                "coefficient": 0.72,
+                "alternatives": [
+                    {
+                        "name": "DRIVEALONE",
+                        "coefficient": 0.35,
+                        "alternatives": ["DA_FREE", "DA_PAY"],
+                    }
+                ],
+            },
+            {
+                "name": "TRANSIT",
+                "coefficient": 0.72,
+                "alternatives": [
+                    {
+                        "name": "WALKACCESS",
+                        "coefficient": 0.50,
+                        "alternatives": ["WALK_LOC", "WALK_EXP"],
+                    }
+                ],
+            },
+            {
+                "name": "NONMOTORIZED",
+                "coefficient": 0.72,
+                "alternatives": ["WALK"],
+            },
+        ],
+    }
+    raw_utilities = pd.Series(
+        {
+            "DA_FREE": 1.4,
+            "DA_PAY": 0.9,
+            "WALK_LOC": 0.5,
+            "WALK_EXP": 0.2,
+            "WALK": 0.0,
+        }
+    )
+    alt_order_array = np.array(["DA_FREE", "DA_PAY", "WALK_LOC", "WALK_EXP", "WALK"])
+
+    expected = _expected_nested_logit_shares(raw_utilities, nest_spec, alt_order_array)
+    method_errors = {name: [] for name in method_names}
+    pair_errors = {pair: [] for pair in pair_names}
+
+    for n_draws in draw_counts:
+        shares_by_method = {name: [] for name in method_names}
+
+        for seed in seeds:
+            shares_by_method["mc"].append(
+                _nested_logit_mc_shares(
+                    raw_utilities,
+                    nest_spec,
+                    alt_order_array,
+                    n_draws=int(n_draws),
+                    seed=seed,
+                )
+            )
+            shares_by_method["tree_walk"].append(
+                _nested_logit_eet_shares(
+                    raw_utilities,
+                    nest_spec,
+                    alt_order_array,
+                    method="tree_walk",
+                    n_draws=int(n_draws),
+                    seed=seed,
+                )
+            )
+            shares_by_method["exact_leaf"].append(
+                _nested_logit_eet_shares(
+                    raw_utilities,
+                    nest_spec,
+                    alt_order_array,
+                    method="exact_leaf",
+                    n_draws=int(n_draws),
+                    seed=seed,
+                )
+            )
+
+        for method_name, share_samples in shares_by_method.items():
+            share_matrix = np.vstack(
+                [share.reindex(alt_order_array).to_numpy() for share in share_samples]
+            )
+            centered = share_matrix - expected.reindex(alt_order_array).to_numpy()
+            method_errors[method_name].append(_rmse(centered))
+
+        for left_name, right_name in pair_names:
+            left_matrix = np.vstack(
+                [
+                    share.reindex(alt_order_array).to_numpy()
+                    for share in shares_by_method[left_name]
+                ]
+            )
+            right_matrix = np.vstack(
+                [
+                    share.reindex(alt_order_array).to_numpy()
+                    for share in shares_by_method[right_name]
+                ]
+            )
+            pair_errors[(left_name, right_name)].append(
+                _rmse(left_matrix - right_matrix)
+            )
+
+    for method_name, errors in method_errors.items():
+        errors = np.asarray(errors, dtype=float)
+        slope = _estimate_power_law_slope(draw_counts, errors)
+        assert (
+            slope_lower <= slope <= slope_upper
+        ), f"{method_name} slope {slope:.3f} outside [{slope_lower}, {slope_upper}]"
+        assert (
+            errors[-1] < errors[0]
+        ), f"{method_name} errors did not decrease: {errors}"
+        if max_final_method_error is not None:
+            assert (
+                errors[-1] <= max_final_method_error
+            ), f"{method_name} final error {errors[-1]:.6f} exceeds {max_final_method_error:.6f}"
+
+    for left_name, right_name in pair_names:
+        errors = np.asarray(pair_errors[(left_name, right_name)], dtype=float)
+        slope = _estimate_power_law_slope(draw_counts, errors)
+        assert (
+            pair_slope_lower <= slope <= pair_slope_upper
+        ), f"{left_name} vs {right_name} slope {slope:.3f} outside [{pair_slope_lower}, {pair_slope_upper}]"
+        assert (
+            errors[-1] < errors[0]
+        ), f"{left_name} vs {right_name} errors did not decrease: {errors}"
+        if max_final_pair_error is not None:
+            assert (
+                errors[-1] <= max_final_pair_error
+            ), f"{left_name} vs {right_name} final error {errors[-1]:.6f} exceeds {max_final_pair_error:.6f}"
+
+
+NESTED_LOGIT_EXACT_PARITY_CASES = [
+    pytest.param(
+        {
+            "name": "root",
+            "coefficient": 1.0,
+            "alternatives": [
+                {
+                    "name": "AUTO",
+                    "coefficient": 0.72,
+                    "alternatives": ["DA_FREE", "DA_PAY"],
+                },
+                {"name": "NONMOTORIZED", "coefficient": 0.80, "alternatives": ["WALK"]},
+            ],
+        },
+        pd.Series({"DA_FREE": 1.2, "DA_PAY": 0.7, "WALK": 0.1}),
+        np.array(["DA_FREE", "DA_PAY", "WALK"]),
+        id="two_level_single_leaf_nest",
+    ),
+    pytest.param(
+        {
+            "name": "root",
+            "coefficient": 1.0,
+            "alternatives": [
+                {
+                    "name": "AUTO",
+                    "coefficient": 0.72,
+                    "alternatives": [
+                        {
+                            "name": "DRIVEALONE",
+                            "coefficient": 0.35,
+                            "alternatives": ["DA_FREE", "DA_PAY"],
+                        }
+                    ],
+                },
+                {
+                    "name": "TRANSIT",
+                    "coefficient": 0.72,
+                    "alternatives": [
+                        {
+                            "name": "WALKACCESS",
+                            "coefficient": 0.50,
+                            "alternatives": ["WALK_LOC", "WALK_EXP"],
+                        }
+                    ],
+                },
+                {
+                    "name": "NONMOTORIZED",
+                    "coefficient": 0.72,
+                    "alternatives": ["WALK"],
+                },
+            ],
+        },
+        pd.Series(
+            {
+                "DA_FREE": 1.4,
+                "DA_PAY": 0.9,
+                "WALK_LOC": 0.5,
+                "WALK_EXP": 0.2,
+                "WALK": 0.0,
+            }
+        ),
+        np.array(["DA_FREE", "DA_PAY", "WALK_LOC", "WALK_EXP", "WALK"]),
+        id="three_level_single_leaf_chains",
+    ),
+    pytest.param(
+        {
+            "name": "root",
+            "coefficient": 1.0,
+            "alternatives": [
+                {
+                    "name": "MOTORIZED",
+                    "coefficient": 0.78,
+                    "alternatives": [
+                        {
+                            "name": "AUTO",
+                            "coefficient": 0.62,
+                            "alternatives": ["DA_FREE", "DA_PAY"],
+                        },
+                        {
+                            "name": "RIDEHAIL",
+                            "coefficient": 0.58,
+                            "alternatives": ["RH_SHARED", "RH_SOLO"],
+                        },
+                    ],
+                },
+                {
+                    "name": "ACTIVE",
+                    "coefficient": 0.85,
+                    "alternatives": ["BIKE", "WALK"],
+                },
+            ],
+        },
+        pd.Series(
+            {
+                "DA_FREE": 1.1,
+                "DA_PAY": 0.8,
+                "RH_SHARED": 0.7,
+                "RH_SOLO": 0.9,
+                "BIKE": 0.2,
+                "WALK": 0.0,
+            }
+        ),
+        np.array(["DA_FREE", "DA_PAY", "RH_SHARED", "RH_SOLO", "BIKE", "WALK"]),
+        id="three_level_balanced",
+    ),
+    pytest.param(
+        {
+            "name": "root",
+            "coefficient": 1.0,
+            "alternatives": [
+                {
+                    "name": "AUTO",
+                    "coefficient": 0.72,
+                    "alternatives": [
+                        {
+                            "name": "DRIVE",
+                            "coefficient": 0.60,
+                            "alternatives": [
+                                {
+                                    "name": "SOLO",
+                                    "coefficient": 0.45,
+                                    "alternatives": ["DA_FREE", "DA_PAY"],
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "name": "TRANSIT",
+                    "coefficient": 0.75,
+                    "alternatives": [
+                        {
+                            "name": "ACCESS",
+                            "coefficient": 0.55,
+                            "alternatives": [
+                                {
+                                    "name": "LOCAL",
+                                    "coefficient": 0.50,
+                                    "alternatives": ["WALK_LOC", "WALK_EXP"],
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {"name": "ACTIVE", "coefficient": 0.82, "alternatives": ["WALK"]},
+            ],
+        },
+        pd.Series(
+            {
+                "DA_FREE": 1.5,
+                "DA_PAY": 1.0,
+                "WALK_LOC": 0.7,
+                "WALK_EXP": 0.4,
+                "WALK": 0.1,
+            }
+        ),
+        np.array(["DA_FREE", "DA_PAY", "WALK_LOC", "WALK_EXP", "WALK"]),
+        id="four_level_single_leaf_chains",
+    ),
+    pytest.param(
+        {
+            "name": "root",
+            "coefficient": 1.0,
+            "alternatives": [
+                {
+                    "name": "MOTORIZED",
+                    "coefficient": 0.80,
+                    "alternatives": [
+                        {
+                            "name": "AUTO",
+                            "coefficient": 0.68,
+                            "alternatives": [
+                                {
+                                    "name": "SOLO",
+                                    "coefficient": 0.48,
+                                    "alternatives": ["DA_FREE", "DA_PAY"],
+                                },
+                                {
+                                    "name": "SHARED",
+                                    "coefficient": 0.52,
+                                    "alternatives": ["SR2", "SR3"],
+                                },
+                            ],
+                        },
+                        {
+                            "name": "TRANSIT",
+                            "coefficient": 0.72,
+                            "alternatives": [
+                                {
+                                    "name": "WALKACCESS",
+                                    "coefficient": 0.55,
+                                    "alternatives": ["WALK_LOC", "WALK_EXP"],
+                                }
+                            ],
+                        },
+                    ],
+                },
+                {"name": "ACTIVE", "coefficient": 0.88, "alternatives": ["BIKE"]},
+            ],
+        },
+        pd.Series(
+            {
+                "DA_FREE": 1.4,
+                "DA_PAY": 1.0,
+                "SR2": 0.8,
+                "SR3": 0.6,
+                "WALK_LOC": 0.7,
+                "WALK_EXP": 0.3,
+                "BIKE": 0.1,
+            }
+        ),
+        np.array(["DA_FREE", "DA_PAY", "SR2", "SR3", "WALK_LOC", "WALK_EXP", "BIKE"]),
+        id="four_level_mixed_structure",
+    ),
+]
+
+
+REALISTIC_NESTED_LOGIT_FAST_CASES = [
+    {
+        "id": "mtc_extended_tour_mode_choice_style",
+        "nest_spec": {
+            "name": "root",
+            "coefficient": 1.0,
+            "alternatives": [
+                {
+                    "name": "AUTO",
+                    "coefficient": 0.72,
+                    "alternatives": [
+                        {
+                            "name": "DRIVEALONE",
+                            "coefficient": 0.35,
+                            "alternatives": ["DRIVEALONEFREE", "DRIVEALONEPAY"],
+                        },
+                        {
+                            "name": "SHAREDRIDE2",
+                            "coefficient": 0.35,
+                            "alternatives": ["SHARED2FREE", "SHARED2PAY"],
+                        },
+                        {
+                            "name": "SHAREDRIDE3",
+                            "coefficient": 0.40,
+                            "alternatives": ["SHARED3FREE", "SHARED3PAY"],
+                        },
+                    ],
+                },
+                {
+                    "name": "NONMOTORIZED",
+                    "coefficient": 0.80,
+                    "alternatives": ["WALK", "BIKE"],
+                },
+                {
+                    "name": "TRANSIT",
+                    "coefficient": 0.60,
+                    "alternatives": [
+                        {
+                            "name": "WALKACCESS",
+                            "coefficient": 0.50,
+                            "alternatives": [
+                                "WALK_LOC",
+                                "WALK_LRF",
+                                "WALK_EXP",
+                                "WALK_HVY",
+                                "WALK_COM",
+                            ],
+                        },
+                        {
+                            "name": "DRIVEACCESS",
+                            "coefficient": 0.45,
+                            "alternatives": [
+                                "DRIVE_LOC",
+                                "DRIVE_LRF",
+                                "DRIVE_EXP",
+                                "DRIVE_HVY",
+                                "DRIVE_COM",
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "name": "RIDEHAIL",
+                    "coefficient": 0.65,
+                    "alternatives": ["TAXI", "TNC_SINGLE", "TNC_SHARED"],
+                },
+            ],
+        },
+        "raw_utilities": pd.Series(
+            {
+                "DRIVEALONEFREE": 1.60,
+                "DRIVEALONEPAY": 1.10,
+                "SHARED2FREE": 1.05,
+                "SHARED2PAY": 0.82,
+                "SHARED3FREE": 0.70,
+                "SHARED3PAY": 0.48,
+                "WALK": -0.20,
+                "BIKE": 0.05,
+                "WALK_LOC": 0.15,
+                "WALK_LRF": 0.05,
+                "WALK_EXP": 0.22,
+                "WALK_HVY": 0.10,
+                "WALK_COM": -0.03,
+                "DRIVE_LOC": 0.42,
+                "DRIVE_LRF": 0.34,
+                "DRIVE_EXP": 0.54,
+                "DRIVE_HVY": 0.38,
+                "DRIVE_COM": 0.26,
+                "TAXI": 0.30,
+                "TNC_SINGLE": 0.45,
+                "TNC_SHARED": 0.18,
+            }
+        ),
+        "alt_order_array": np.array(
+            [
+                "DRIVEALONEFREE",
+                "DRIVEALONEPAY",
+                "SHARED2FREE",
+                "SHARED2PAY",
+                "SHARED3FREE",
+                "SHARED3PAY",
+                "WALK",
+                "BIKE",
+                "WALK_LOC",
+                "WALK_LRF",
+                "WALK_EXP",
+                "WALK_HVY",
+                "WALK_COM",
+                "DRIVE_LOC",
+                "DRIVE_LRF",
+                "DRIVE_EXP",
+                "DRIVE_HVY",
+                "DRIVE_COM",
+                "TAXI",
+                "TNC_SINGLE",
+                "TNC_SHARED",
+            ]
+        ),
+    },
+    {
+        "id": "semcog_tour_mode_choice_style",
+        "nest_spec": {
+            "name": "root",
+            "coefficient": 1.0,
+            "alternatives": [
+                {
+                    "name": "AUTO",
+                    "coefficient": 0.78,
+                    "alternatives": ["DRIVEALONE", "SHARED2", "SHARED3"],
+                },
+                {
+                    "name": "NONMOTORIZED",
+                    "coefficient": 0.85,
+                    "alternatives": ["WALK", "BIKE"],
+                },
+                {
+                    "name": "TRANSIT",
+                    "coefficient": 0.64,
+                    "alternatives": [
+                        {
+                            "name": "WALKACCESS",
+                            "coefficient": 0.56,
+                            "alternatives": ["WALK_LOC", "WALK_PRM", "WALK_MIX"],
+                        },
+                        {
+                            "name": "PNRACCESS",
+                            "coefficient": 0.52,
+                            "alternatives": ["PNR_LOC", "PNR_PRM", "PNR_MIX"],
+                        },
+                        {
+                            "name": "KNRACCESS",
+                            "coefficient": 0.50,
+                            "alternatives": ["KNR_LOC", "KNR_PRM", "KNR_MIX"],
+                        },
+                    ],
+                },
+                {
+                    "name": "SCHOOL_BUS",
+                    "coefficient": 0.92,
+                    "alternatives": ["SCHOOLBUS"],
+                },
+                {
+                    "name": "RIDEHAIL",
+                    "coefficient": 0.68,
+                    "alternatives": ["TAXI", "TNC_SINGLE", "TNC_SHARED"],
+                },
+            ],
+        },
+        "raw_utilities": pd.Series(
+            {
+                "DRIVEALONE": 1.45,
+                "SHARED2": 1.08,
+                "SHARED3": 0.76,
+                "WALK": -0.10,
+                "BIKE": 0.12,
+                "WALK_LOC": 0.10,
+                "WALK_PRM": 0.18,
+                "WALK_MIX": 0.06,
+                "PNR_LOC": 0.30,
+                "PNR_PRM": 0.36,
+                "PNR_MIX": 0.26,
+                "KNR_LOC": 0.27,
+                "KNR_PRM": 0.32,
+                "KNR_MIX": 0.21,
+                "SCHOOLBUS": 0.24,
+                "TAXI": 0.22,
+                "TNC_SINGLE": 0.40,
+                "TNC_SHARED": 0.16,
+            }
+        ),
+        "alt_order_array": np.array(
+            [
+                "DRIVEALONE",
+                "SHARED2",
+                "SHARED3",
+                "WALK",
+                "BIKE",
+                "WALK_LOC",
+                "WALK_PRM",
+                "WALK_MIX",
+                "PNR_LOC",
+                "PNR_PRM",
+                "PNR_MIX",
+                "KNR_LOC",
+                "KNR_PRM",
+                "KNR_MIX",
+                "SCHOOLBUS",
+                "TAXI",
+                "TNC_SINGLE",
+                "TNC_SHARED",
+            ]
+        ),
+    },
+]
+
+
+@pytest.mark.parametrize(
+    "nest_spec,raw_utilities,alt_order_array",
+    NESTED_LOGIT_EXACT_PARITY_CASES,
+)
+def test_make_choices_vs_eet_nl_exact_leaf_parity_across_structures(
+    nest_spec, raw_utilities, alt_order_array
+):
+    n_draws = 100_000
+    expected = _expected_nested_logit_shares(raw_utilities, nest_spec, alt_order_array)
+    observed = _nested_logit_eet_shares(
+        raw_utilities,
+        nest_spec,
+        alt_order_array,
+        method="exact_leaf",
+        n_draws=n_draws,
+    )
+
+    _assert_empirical_shares_close(observed, expected, n_draws=n_draws)
+
+
+def test_exact_leaf_error_terms_use_float64_with_float32_nested_utilities():
+    nest_spec = {
+        "name": "root",
+        "coefficient": 1.0,
+        "alternatives": [
+            {"name": "motorized", "coefficient": 0.5, "alternatives": ["car", "bus"]},
+            "walk",
+        ],
+    }
+    raw_utilities = pd.DataFrame(
+        np.array([[0.5, 0.2, 0.4]], dtype=np.float32),
+        index=pd.RangeIndex(1, name="chooser_id"),
+        columns=["car", "bus", "walk"],
+    )
+    nested_utilities = simulate.compute_nested_utilities(
+        raw_utilities, nest_spec
+    ).astype(np.float32)
+    alt_order_array = np.array(["car", "bus", "walk"])
+    state = _make_rng_state(
+        nested_utilities,
+        seed=17,
+        step_name="exact_leaf_float64_dtype",
+        nested_method="exact_leaf",
+    )
+
+    try:
+        error_terms = logit.sample_nested_logit_exact_leaf_error_terms(
+            state,
+            nested_utilities,
+            alt_order_array,
+            nest_spec,
+        )
+    finally:
+        _finish_rng_state(state, "exact_leaf_float64_dtype")
+
+    assert all(dtype == np.float64 for dtype in error_terms.dtypes)
+
+
+@pytest.mark.parametrize(
+    "nest_spec,raw_utilities,alt_order_array",
+    [
+        NESTED_LOGIT_EXACT_PARITY_CASES[1],
+        NESTED_LOGIT_EXACT_PARITY_CASES[3],
+    ],
+)
+def test_make_choices_vs_eet_nl_tree_walk_parity_deeper_structures(
+    nest_spec, raw_utilities, alt_order_array
+):
+    n_draws = 20_000
+    expected = _expected_nested_logit_shares(raw_utilities, nest_spec, alt_order_array)
+    observed = _nested_logit_eet_shares(
+        raw_utilities,
+        nest_spec,
+        alt_order_array,
+        method="tree_walk",
+        n_draws=n_draws,
+    )
+
+    _assert_empirical_shares_close(observed, expected, n_draws=n_draws)
+
+
+def test_make_choices_utility_based_uses_exact_leaf_setting(monkeypatch):
+    sentinel = pd.Series([1, 0], index=[100, 101])
+
+    def fake_exact_leaf(
+        state,
+        nested_utilities,
+        alt_order_array,
+        nest_spec,
+        trace_label,
+        trace_choosers=None,
+        allow_bad_utils=False,
+    ):
+        assert list(alt_order_array) == ["car", "walk"]
+        return sentinel
+
+    monkeypatch.setattr(
+        logit,
+        "make_choices_explicit_error_term_nl_exact_leaf",
+        fake_exact_leaf,
+    )
+
+    state = workflow.State().default_settings()
+    state.settings.nested_explicit_error_term_method = "exact_leaf"
+    utilities = pd.DataFrame(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        index=pd.Index([100, 101], name="chooser_id"),
+        columns=["motorized", "walk", "car"],
+    )
+    nest_spec = {
+        "name": "root",
+        "coefficient": 1.0,
+        "alternatives": [
+            {"name": "motorized", "coefficient": 0.7, "alternatives": ["car"]},
+            "walk",
+        ],
+    }
+
+    choices, rands = logit.make_choices_utility_based(
+        state,
+        utilities,
+        name_mapping=np.array(["car", "walk"]),
+        nest_spec=nest_spec,
+        trace_label=None,
+    )
+
+    pdt.assert_series_equal(choices, sentinel)
+    pdt.assert_series_equal(
+        rands,
+        pd.Series([0, 0], index=pd.Index([100, 101], name="chooser_id")),
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    REALISTIC_NESTED_LOGIT_FAST_CASES,
+    ids=[case["id"] for case in REALISTIC_NESTED_LOGIT_FAST_CASES],
+)
+def test_nested_logit_methods_match_expected_shares_for_realistic_tour_mode_choice_nests(
+    case,
+):
+    _assert_nested_logit_methods_match_expected_across_seeds(
+        case["raw_utilities"],
+        case["nest_spec"],
+        case["alt_order_array"],
+        n_draws=6_000,
+        seeds=[11, 23, 37],
+    )
+
+
+def test_nested_logit_share_response_tracks_utility_perturbations():
+    case = REALISTIC_NESTED_LOGIT_FAST_CASES[0]
+    base_utilities = case["raw_utilities"]
+    perturbed_utilities = base_utilities.copy()
+    perturbed_utilities["DRIVE_EXP"] += 0.60
+    perturbed_utilities["TNC_SHARED"] -= 0.45
+
+    baseline_expected = _expected_nested_logit_shares(
+        base_utilities, case["nest_spec"], case["alt_order_array"]
+    )
+    perturbed_expected = _expected_nested_logit_shares(
+        perturbed_utilities, case["nest_spec"], case["alt_order_array"]
+    )
+
+    expected_delta = perturbed_expected - baseline_expected
+    assert expected_delta["DRIVE_EXP"] > 0
+    assert expected_delta["TNC_SHARED"] < 0
+
+    for method in ("mc", "tree_walk", "exact_leaf"):
+        baseline_matrix = _nested_logit_method_share_matrix(
+            base_utilities,
+            case["nest_spec"],
+            case["alt_order_array"],
+            method=method,
+            n_draws=8_000,
+            seeds=[11, 23, 37],
+        )
+        perturbed_matrix = _nested_logit_method_share_matrix(
+            perturbed_utilities,
+            case["nest_spec"],
+            case["alt_order_array"],
+            method=method,
+            n_draws=8_000,
+            seeds=[11, 23, 37],
+        )
+        _assert_average_empirical_shares_close(
+            baseline_matrix,
+            baseline_expected,
+            n_draws=8_000,
+        )
+        _assert_average_empirical_shares_close(
+            perturbed_matrix,
+            perturbed_expected,
+            n_draws=8_000,
+        )
+        _assert_average_share_deltas_close(
+            baseline_matrix,
+            perturbed_matrix,
+            baseline_expected,
+            perturbed_expected,
+            n_draws=8_000,
+        )
+
+
+def test_three_level_nested_logit_methods_follow_monte_carlo_power_law():
+    _assert_three_level_nested_logit_methods_follow_power_law(
+        draw_counts=np.array([2_000, 8_000, 32_000]),
+        seeds=[17, 29, 43],
+    )
+
+
+# # @pytest.mark.slow
+# def test_three_level_nested_logit_methods_follow_monte_carlo_power_law_large_draws():
+#     _assert_three_level_nested_logit_methods_follow_power_law(
+#         draw_counts=np.array([8_000, 32_000, 128_000]),
+#         seeds=[17, 29, 43],
+#         slope_lower=-0.7,
+#         slope_upper=-0.3,
+#         pair_slope_lower=-1.0,
+#         pair_slope_upper=-0.2,
+#         max_final_method_error=0.0015,
+#         max_final_pair_error=0.0020,
+#     )
 
 
 #

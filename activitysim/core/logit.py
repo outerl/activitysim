@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Union
+from typing import Literal, Union
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,9 @@ UTIL_UNAVAILABLE = 1000.0 * (UTIL_MIN - 1.0)
 
 PROB_MIN = 0.0
 PROB_MAX = 1.0
+
+
+EXACT_NESTED_LOGIT_DTYPE = np.float64
 
 
 @dataclass
@@ -389,8 +392,20 @@ def add_ev1_random(
     Parameters
     ----------
     state : workflow.State
+
     df : pandas.DataFrame
         Utilities indexed by chooser and with alternatives as columns.
+
+    alt_info : AltsContext, optional
+        If provided, will be used to determine how many random numbers to sample and how to index them.
+        If not provided, will sample a random number for each alternative column in df.
+        Note alt_info and alt_nrs_df must both be provided or both be omitted together.
+
+    alt_nrs_df : pandas.DataFrame, optional
+        DataFrame with same index as df and columns corresponding to alt_info.max_alt_id, containing the
+        alt_nrs for each alternative for each chooser. This is used to index into the random numbers when
+        alt_info is provided, and should contain -999 for any alternatives that are not available for a
+        given chooser.
 
     Returns
     -------
@@ -403,7 +418,6 @@ def add_ev1_random(
     ), "alt_info and alt_nrs_df must both be provided or omitted together"
 
     if alt_info is None:
-        # Fallback behaviour for models where alt_info/alt_nrs_df are not provided (e.g. non-integer alts)
         rands = state.get_rn_generator().gumbel_for_df(
             nest_utils_for_choice, n=nest_utils_for_choice.shape[1]
         )
@@ -434,6 +448,166 @@ def add_ev1_random(
     return nest_utils_for_choice
 
 
+def _log_positive_stable_for_df(
+    state: workflow.State, df: pd.DataFrame, alpha: float
+) -> np.ndarray:
+    if np.isclose(alpha, 1.0):
+        return np.zeros(len(df), dtype=EXACT_NESTED_LOGIT_DTYPE)
+
+    eps = np.finfo(EXACT_NESTED_LOGIT_DTYPE).eps
+    uniforms = np.asarray(
+        state.get_rn_generator().random_for_df(df, n=2),
+        dtype=EXACT_NESTED_LOGIT_DTYPE,
+    )
+    angle_uniform = np.clip(uniforms[:, 0], eps, 1.0 - eps)
+    exp_uniform = np.clip(uniforms[:, 1], eps, 1.0 - eps)
+
+    alpha = EXACT_NESTED_LOGIT_DTYPE(alpha)
+    pi = EXACT_NESTED_LOGIT_DTYPE(np.pi)
+    one = EXACT_NESTED_LOGIT_DTYPE(1.0)
+
+    u = eps + (pi - EXACT_NESTED_LOGIT_DTYPE(2.0) * eps) * angle_uniform
+    w = -np.log(exp_uniform)
+
+    return (
+        np.log(np.sin(alpha * u))
+        - np.log(np.sin(u)) / alpha
+        + ((one - alpha) / alpha) * (np.log(np.sin((one - alpha) * u)) - np.log(w))
+    )
+
+
+def _leaf_path_coefficients(
+    nest_spec: dict | LogitNestSpec, alt_order_array: np.ndarray
+) -> pd.Series:
+    coefficients = pd.Series(
+        {
+            nest.name: nest.product_of_coefficients
+            for nest in each_nest(nest_spec, type="leaf")
+        },
+        dtype=EXACT_NESTED_LOGIT_DTYPE,
+    ).reindex(alt_order_array)
+
+    if coefficients.isna().any():
+        missing = coefficients[coefficients.isna()].index.tolist()
+        raise ValueError(f"leaf alternatives missing from nest spec: {missing}")
+
+    return coefficients
+
+
+def sample_nested_logit_exact_leaf_error_terms(
+    state: workflow.State,
+    nested_utilities: pd.DataFrame,
+    alt_order_array: np.ndarray,
+    nest_spec: dict | LogitNestSpec,
+) -> pd.DataFrame:
+    root_nest = next(iter(each_nest(nest_spec, post_order=False)))
+    if not np.isclose(root_nest.coefficient, 1.0):
+        raise ValueError(
+            "exact leaf nested-logit sampler requires a root coefficient of 1.0"
+        )
+
+    alt_order_array = np.asarray(alt_order_array)
+    leaf_gumbels = pd.DataFrame(
+        np.asarray(
+            state.get_rn_generator().gumbel_for_df(
+                nested_utilities, n=len(alt_order_array)
+            ),
+            dtype=EXACT_NESTED_LOGIT_DTYPE,
+        ),
+        index=nested_utilities.index,
+        columns=alt_order_array,
+    )
+    error_terms = pd.DataFrame(
+        index=nested_utilities.index,
+        columns=alt_order_array,
+        dtype=EXACT_NESTED_LOGIT_DTYPE,
+    )
+
+    def recurse(
+        node_spec: dict | LogitNestSpec,
+        path_coefficient: float,
+        parent_log_rate: np.ndarray,
+    ) -> None:
+        if isinstance(node_spec, LogitNestSpec):
+            node_spec = node_spec.model_dump(mode="python")
+
+        for child in node_spec["alternatives"]:
+            if isinstance(child, LogitNestSpec):
+                child = child.model_dump(mode="python")
+
+            if isinstance(child, dict):
+                child_coefficient = child["coefficient"]
+                child_log_rate = (
+                    parent_log_rate / child_coefficient
+                    + _log_positive_stable_for_df(
+                        state, nested_utilities, child_coefficient
+                    )
+                )
+                recurse(
+                    child,
+                    path_coefficient * child_coefficient,
+                    child_log_rate,
+                )
+            else:
+                error_terms[child] = path_coefficient * (
+                    parent_log_rate + leaf_gumbels[child].to_numpy()
+                )
+
+    recurse(
+        nest_spec,
+        root_nest.coefficient,
+        np.zeros(len(nested_utilities), dtype=EXACT_NESTED_LOGIT_DTYPE),
+    )
+    return error_terms.loc[:, alt_order_array]
+
+
+def make_choices_explicit_error_term_nl_exact_leaf(
+    state: workflow.State,
+    nested_utilities: pd.DataFrame,
+    alt_order_array: np.ndarray,
+    nest_spec: dict | LogitNestSpec,
+    trace_label: str,
+    trace_choosers=None,
+    allow_bad_utils: bool = False,
+) -> pd.Series:
+    alt_order_array = np.asarray(alt_order_array)
+    path_coefficients = _leaf_path_coefficients(nest_spec, alt_order_array)
+    raw_leaf_utilities = (
+        nested_utilities.loc[:, alt_order_array]
+        .mul(path_coefficients, axis=1)
+        .astype(EXACT_NESTED_LOGIT_DTYPE, copy=False)
+    )
+    utilities_incl_unobs = (
+        raw_leaf_utilities
+        + sample_nested_logit_exact_leaf_error_terms(
+            state,
+            nested_utilities,
+            alt_order_array,
+            nest_spec,
+        )
+    )
+
+    if trace_label:
+        state.tracing.trace_df(
+            utilities_incl_unobs,
+            tracing.extend_trace_label(trace_label, "leaf_utilities_eet_exact"),
+        )
+
+    choices = np.argmax(utilities_incl_unobs.to_numpy(), axis=1)
+    missing_choices = np.isnan(choices)
+    if missing_choices.any() and not allow_bad_utils:
+        report_bad_choices(
+            state,
+            missing_choices,
+            raw_leaf_utilities,
+            trace_label=tracing.extend_trace_label(trace_label, "bad_utils"),
+            msg="no alternative selected",
+            trace_choosers=trace_choosers,
+        )
+
+    return pd.Series(choices, index=utilities_incl_unobs.index)
+
+
 def choose_from_tree(
     nest_utils, all_alternatives, logit_nest_groups, nest_alternatives_by_name
 ):
@@ -448,41 +622,23 @@ def choose_from_tree(
     raise ValueError("This should never happen - no alternative found")
 
 
-def make_choices_explicit_error_term_nl(
-    state,
-    nested_utilities,
-    alt_order_array,
-    nest_spec,
-    trace_label,
+def make_choices_explicit_error_term_nl_tree_walk(
+    state: workflow.State,
+    nested_utilities: pd.DataFrame,
+    alt_order_array: np.ndarray,
+    nest_spec: dict | LogitNestSpec,
+    trace_label: str,
     trace_choosers=None,
-    allow_bad_utils=False,
+    allow_bad_utils: bool = False,
     alts_context: AltsContext | None = None,
     alt_nrs_df: pd.DataFrame | None = None,
-):
-    """
-    Walk down the nesting tree and make a choice at each level using EET.
-
-    Parameters
-    ----------
-    state : workflow.State
-    nested_utilities : pandas.DataFrame
-        Utilities for nest and leaf nodes.
-    alt_order_array : numpy.ndarray
-        Leaf alternatives in the original ordering.
-    nest_spec : dict or LogitNestSpec
-        Nest specification for the choice model.
-    trace_label : str
-        Trace label for logging and tracing.
-
-    Returns
-    -------
-    pandas.Series
-        Choice indices aligned to `alt_order_array`.
-    """
+) -> pd.Series:
+    """Walk down the nesting tree and make a choice at each level using EET."""
     if trace_label:
         state.tracing.trace_df(
             nested_utilities, tracing.extend_trace_label(trace_label, "nested_utils")
         )
+
     nest_utils_for_choice = add_ev1_random(
         state, nested_utilities, alts_context, alt_nrs_df
     )
@@ -520,6 +676,67 @@ def make_choices_explicit_error_term_nl(
     choices = choices.map({v: k for k, v in enumerate(alt_order_array)})
 
     return choices
+
+
+def make_choices_explicit_error_term_nl(
+    state,
+    nested_utilities,
+    alt_order_array,
+    nest_spec,
+    trace_label,
+    trace_choosers=None,
+    allow_bad_utils=False,
+    alts_context: AltsContext | None = None,
+    alt_nrs_df: pd.DataFrame | None = None,
+):
+    """
+    Nested logit choice with EET, either by walking down the tree and drawing EV1 terms for all nodes and leaf nodes,
+    or by sampling error terms for leaf nodes only.
+
+    Parameters
+    ----------
+    state : workflow.State
+    nested_utilities : pandas.DataFrame
+        Utilities for nest and leaf nodes.
+    alt_order_array : numpy.ndarray
+        Leaf alternatives in the original ordering.
+    nest_spec : dict or LogitNestSpec
+        Nest specification for the choice model.
+    trace_label : str
+        Trace label for logging and tracing.
+
+    Returns
+    -------
+    pandas.Series
+        Choice indices aligned to `alt_order_array`.
+    """
+    sampling_method = state.settings.nested_explicit_error_term_method
+
+    if sampling_method == "exact_leaf":
+        return make_choices_explicit_error_term_nl_exact_leaf(
+            state,
+            nested_utilities,
+            alt_order_array,
+            nest_spec,
+            trace_label,
+            trace_choosers=trace_choosers,
+            allow_bad_utils=allow_bad_utils,
+        )
+
+    if sampling_method == "tree_walk":
+        return make_choices_explicit_error_term_nl_tree_walk(
+            state,
+            nested_utilities,
+            alt_order_array,
+            nest_spec,
+            trace_label,
+            trace_choosers=trace_choosers,
+            allow_bad_utils=allow_bad_utils,
+            alts_context=alts_context,
+            alt_nrs_df=alt_nrs_df,
+        )
+
+    raise ValueError(f"unknown nested explicit error term method: {sampling_method}")
 
 
 def make_choices_explicit_error_term_mnl(
