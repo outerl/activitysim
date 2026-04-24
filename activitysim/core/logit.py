@@ -790,43 +790,6 @@ def make_choices_explicit_error_term_mnl(
     return choices
 
 
-def make_choices_explicit_error_term(
-    state,
-    utilities,
-    alt_order_array,
-    nest_spec=None,
-    trace_label=None,
-    trace_choosers=None,
-    allow_bad_utils=False,
-    alts_context: AltsContext | None = None,
-    alt_nrs_df: pd.DataFrame | None = None,
-) -> pd.Series:
-    trace_label = tracing.extend_trace_label(trace_label, "make_choices_eet")
-    if nest_spec is None:
-        choices = make_choices_explicit_error_term_mnl(
-            state,
-            utilities,
-            trace_label,
-            trace_choosers,
-            allow_bad_utils,
-            alts_context,
-            alt_nrs_df,
-        )
-    else:
-        choices = make_choices_explicit_error_term_nl(
-            state,
-            utilities,
-            alt_order_array,
-            nest_spec,
-            trace_label,
-            trace_choosers,
-            allow_bad_utils,
-            alts_context,
-            alt_nrs_df,
-        )
-    return choices
-
-
 def make_choices_utility_based(
     state: workflow.State,
     utilities: pd.DataFrame,
@@ -838,22 +801,76 @@ def make_choices_utility_based(
     alts_context: AltsContext | None = None,
     alt_nrs_df: pd.DataFrame | None = None,
 ) -> tuple[pd.Series, pd.Series]:
+    """
+    Make choices for each chooser from among a set of alternatives based on utilities by adding
+    random error terms and choosing the maximum utility alternative.
+
+    Parameters
+    ----------
+    utilities : pandas.DataFrame
+        Utilities with choosers as rows and alternatives as columns. Note for nested logit models,
+        this should include both nest and leaf nodes and the mapping from nest to leaf nodes should
+        be provided via `name_mapping` and `nest_spec`.
+    name_mapping : dict, optional
+        Mapping from nest and leaf names in `utilities` to the original alternative ordering. Only needed
+        for nested logit models.
+    nest_spec : dict or LogitNestSpec, optional
+        Nest specification for the choice model. If None, will be treated as a multinomial logit model.
+    trace_label : str
+        Trace label for logging and tracing.
+    trace_choosers : pandas.dataframe
+        the choosers df (for interaction_simulate) to facilitate the reporting of hh_id
+        by report_bad_choices because it can't deduce hh_id from the interaction_dataset
+        which is indexed on index values from alternatives df.
+    allow_bad_utils : bool
+        If True, allows utilities with missing or invalid values without raising an error.
+    alts_context : AltsContext, optional
+        If provided, will be used to determine how many random numbers to sample and how to index them for the EET
+        sampling. This is only relevant for multinomial logit models, and should be provided along with alt_nrs_df.
+    alt_nrs_df : pandas.DataFrame, optional
+        DataFrame with same index as `utilities` and columns corresponding to `alts_context.max_alt_id`, containing
+        the alt_nrs for each alternative for each chooser. This is used to index into the random numbers when sampling
+        EET terms for multinomial logit models, and should contain -999 for any alternatives that are not available
+        for a given chooser. Should be provided along with `alts_context`.
+
+    Returns
+    -------
+    choices : pandas.Series
+        Maps chooser IDs (from `probs` index) to a choice, where the choice
+        is an index into the columns of `probs`.
+    rands : pandas.Series
+        A series of 0s for compatibility with make_choices. For EET, we do not have per-row random numbers.
+    """
     trace_label = tracing.extend_trace_label(trace_label, "make_choices_utility_based")
 
-    # For nested models, choices are mapped to `name_mapping` ordering inside the
-    # EET helper. For MNL, choices already follow the utilities column order.
-    choices = make_choices_explicit_error_term(
-        state,
-        utilities,
-        name_mapping,
-        nest_spec,
-        trace_label,
-        trace_choosers=trace_choosers,
-        allow_bad_utils=allow_bad_utils,
-        alts_context=alts_context,
-        alt_nrs_df=alt_nrs_df,
-    )
+    if nest_spec is None:
+        choices = make_choices_explicit_error_term_mnl(
+            state,
+            utilities,
+            trace_label,
+            trace_choosers,
+            allow_bad_utils,
+            alts_context,
+            alt_nrs_df,
+        )
+    else:
+        # For nested models, choices are mapped to `name_mapping` ordering inside the
+        # EET helper because utilities contains node and leaf values.
+        choices = make_choices_explicit_error_term_nl(
+            state,
+            utilities,
+            name_mapping,
+            nest_spec,
+            trace_label,
+            trace_choosers,
+            allow_bad_utils,
+            alts_context,
+            alt_nrs_df,
+        )
+
     # EET does not expose per-row random draws; return zeros for compatibility.
+    # Maybe exposing the seed of the chooser could be an alternative to re-create the random number for
+    # debugging/tracing purposes?
     rands = pd.Series(np.zeros_like(utilities.index.values), index=utilities.index)
 
     return choices, rands
