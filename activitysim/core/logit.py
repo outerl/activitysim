@@ -451,6 +451,7 @@ def add_ev1_random(
 def _log_positive_stable_for_df(
     state: workflow.State, df: pd.DataFrame, alpha: float
 ) -> np.ndarray:
+    alpha = EXACT_NESTED_LOGIT_DTYPE(alpha)
     if np.isclose(alpha, 1.0):
         return np.zeros(len(df), dtype=EXACT_NESTED_LOGIT_DTYPE)
 
@@ -462,17 +463,13 @@ def _log_positive_stable_for_df(
     angle_uniform = np.clip(uniforms[:, 0], eps, 1.0 - eps)
     exp_uniform = np.clip(uniforms[:, 1], eps, 1.0 - eps)
 
-    alpha = EXACT_NESTED_LOGIT_DTYPE(alpha)
-    pi = EXACT_NESTED_LOGIT_DTYPE(np.pi)
-    one = EXACT_NESTED_LOGIT_DTYPE(1.0)
-
-    u = eps + (pi - EXACT_NESTED_LOGIT_DTYPE(2.0) * eps) * angle_uniform
+    u = eps + (np.pi - 2.0 * eps) * angle_uniform
     w = -np.log(exp_uniform)
 
     return (
         np.log(np.sin(alpha * u))
         - np.log(np.sin(u)) / alpha
-        + ((one - alpha) / alpha) * (np.log(np.sin((one - alpha) * u)) - np.log(w))
+        + ((1.0 - alpha) / alpha) * (np.log(np.sin((1.0 - alpha) * u)) - np.log(w))
     )
 
 
@@ -496,8 +493,7 @@ def _leaf_path_coefficients(
 
 def sample_nested_logit_exact_leaf_error_terms(
     state: workflow.State,
-    nested_utilities: pd.DataFrame,
-    alt_order_array: np.ndarray,
+    alt_utilities: pd.DataFrame,
     nest_spec: dict | LogitNestSpec,
 ) -> pd.DataFrame:
     root_nest = next(iter(each_nest(nest_spec, post_order=False)))
@@ -510,18 +506,21 @@ def sample_nested_logit_exact_leaf_error_terms(
     leaf_gumbels = pd.DataFrame(
         np.asarray(
             state.get_rn_generator().gumbel_for_df(
-                nested_utilities, n=len(alt_order_array)
+                alt_utilities, n=len(alt_order_array)
             ),
             dtype=EXACT_NESTED_LOGIT_DTYPE,
         ),
-        index=nested_utilities.index,
-        columns=alt_order_array,
+        index=alt_utilities.index,
+        columns=alt_utilities.columns.values,
     )
+    # no this is broken now. Let's just write this out explicitly.
     error_terms = pd.DataFrame(
-        index=nested_utilities.index,
-        columns=alt_order_array,
+        index=alt_utilities.index,
+        columns=alt_utilities.columns.values,
         dtype=EXACT_NESTED_LOGIT_DTYPE,
     )
+
+    # TODO: len(nested_utilities) needs to be length of all nests, including root (used below and in positive_stable_draws due to recursion)
 
     def recurse(
         node_spec: dict | LogitNestSpec,
@@ -540,7 +539,7 @@ def sample_nested_logit_exact_leaf_error_terms(
                 child_log_rate = (
                     parent_log_rate / child_coefficient
                     + _log_positive_stable_for_df(
-                        state, nested_utilities, child_coefficient
+                        state, alt_utilities, child_coefficient
                     )
                 )
                 recurse(
@@ -563,29 +562,20 @@ def sample_nested_logit_exact_leaf_error_terms(
 
 def make_choices_explicit_error_term_nl_exact_leaf(
     state: workflow.State,
-    nested_utilities: pd.DataFrame,
-    alt_order_array: np.ndarray,
+    alt_utilities: pd.DataFrame,
     nest_spec: dict | LogitNestSpec,
     trace_label: str,
     trace_choosers=None,
     allow_bad_utils: bool = False,
 ) -> pd.Series:
     alt_order_array = np.asarray(alt_order_array)
-    path_coefficients = _leaf_path_coefficients(nest_spec, alt_order_array)
-    raw_leaf_utilities = (
-        nested_utilities.loc[:, alt_order_array]
-        .mul(path_coefficients, axis=1)
-        .astype(EXACT_NESTED_LOGIT_DTYPE, copy=False)
+
+    utilities_incl_unobs = sample_nested_logit_exact_leaf_error_terms(
+        state,
+        alt_utilities,
+        nest_spec,
     )
-    utilities_incl_unobs = (
-        raw_leaf_utilities
-        + sample_nested_logit_exact_leaf_error_terms(
-            state,
-            nested_utilities,
-            alt_order_array,
-            nest_spec,
-        )
-    )
+    utilities_incl_unobs += alt_utilities
 
     if trace_label:
         state.tracing.trace_df(
@@ -599,7 +589,7 @@ def make_choices_explicit_error_term_nl_exact_leaf(
         report_bad_choices(
             state,
             missing_choices,
-            raw_leaf_utilities,
+            utilities_incl_unobs,
             trace_label=tracing.extend_trace_label(trace_label, "bad_utils"),
             msg="no alternative selected",
             trace_choosers=trace_choosers,
@@ -624,8 +614,7 @@ def choose_from_tree(
 
 def make_choices_explicit_error_term_nl_tree_walk(
     state: workflow.State,
-    nested_utilities: pd.DataFrame,
-    alt_order_array: np.ndarray,
+    alt_utilities: pd.DataFrame,
     nest_spec: dict | LogitNestSpec,
     trace_label: str,
     trace_choosers=None,
@@ -638,6 +627,10 @@ def make_choices_explicit_error_term_nl_tree_walk(
         state.tracing.trace_df(
             nested_utilities, tracing.extend_trace_label(trace_label, "nested_utils")
         )
+
+    from activitysim.core.simulate import compute_nested_utilities
+
+    nested_utilities = compute_nested_utilities(alt_utilities, nest_spec)
 
     nest_utils_for_choice = add_ev1_random(
         state, nested_utilities, alts_context, alt_nrs_df
@@ -673,15 +666,14 @@ def make_choices_explicit_error_term_nl_tree_walk(
 
     # In order for choice indexing to be consistent with MNL and cumsum MC choices, we need to index in the order
     #  alternatives were originally created before adding nest nodes that are not elemental alternatives
-    choices = choices.map({v: k for k, v in enumerate(alt_order_array)})
+    choices = choices.map({v: k for k, v in enumerate(alt_utilities.columns.values)})
 
     return choices
 
 
 def make_choices_explicit_error_term_nl(
     state,
-    nested_utilities,
-    alt_order_array,
+    alt_utilities,
     nest_spec,
     trace_label,
     trace_choosers=None,
@@ -696,10 +688,8 @@ def make_choices_explicit_error_term_nl(
     Parameters
     ----------
     state : workflow.State
-    nested_utilities : pandas.DataFrame
-        Utilities for nest and leaf nodes.
-    alt_order_array : numpy.ndarray
-        Leaf alternatives in the original ordering.
+    alt_utilities : pandas.DataFrame
+        Utilities for fundamental alternatives (leaf nodes).
     nest_spec : dict or LogitNestSpec
         Nest specification for the choice model.
     trace_label : str
@@ -708,15 +698,14 @@ def make_choices_explicit_error_term_nl(
     Returns
     -------
     pandas.Series
-        Choice indices aligned to `alt_order_array`.
+        Choice indices aligned to `alt_utilities` columns.
     """
     sampling_method = state.settings.nested_explicit_error_term_method
 
     if sampling_method == "exact_leaf":
         return make_choices_explicit_error_term_nl_exact_leaf(
             state,
-            nested_utilities,
-            alt_order_array,
+            alt_utilities,
             nest_spec,
             trace_label,
             trace_choosers=trace_choosers,
@@ -726,8 +715,7 @@ def make_choices_explicit_error_term_nl(
     if sampling_method == "tree_walk":
         return make_choices_explicit_error_term_nl_tree_walk(
             state,
-            nested_utilities,
-            alt_order_array,
+            alt_utilities,
             nest_spec,
             trace_label,
             trace_choosers=trace_choosers,
@@ -809,11 +797,7 @@ def make_choices_utility_based(
     ----------
     utilities : pandas.DataFrame
         Utilities with choosers as rows and alternatives as columns. Note for nested logit models,
-        this should include both nest and leaf nodes and the mapping from nest to leaf nodes should
-        be provided via `name_mapping` and `nest_spec`.
-    name_mapping : dict, optional
-        Mapping from nest and leaf names in `utilities` to the original alternative ordering. Only needed
-        for nested logit models.
+        this should include only leaf nodes.
     nest_spec : dict or LogitNestSpec, optional
         Nest specification for the choice model. If None, will be treated as a multinomial logit model.
     trace_label : str
@@ -859,7 +843,6 @@ def make_choices_utility_based(
         choices = make_choices_explicit_error_term_nl(
             state,
             utilities,
-            name_mapping,
             nest_spec,
             trace_label,
             trace_choosers,

@@ -1,6 +1,8 @@
 # ActivitySim
 # See full license in LICENSE.txt.
 
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -180,7 +182,6 @@ def test_interaction_sample_simulate_passes_alts_context_and_alt_nrs_df(
     def fake_make_choices_utility_based(
         _state,
         utilities,
-        name_mapping=None,
         nest_spec=None,
         trace_label=None,
         trace_choosers=None,
