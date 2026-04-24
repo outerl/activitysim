@@ -496,68 +496,55 @@ def sample_nested_logit_exact_leaf_error_terms(
     alt_utilities: pd.DataFrame,
     nest_spec: dict | LogitNestSpec,
 ) -> pd.DataFrame:
-    root_nest = next(iter(each_nest(nest_spec, post_order=False)))
-    if not np.isclose(root_nest.coefficient, 1.0):
-        raise ValueError(
-            "exact leaf nested-logit sampler requires a root coefficient of 1.0"
-        )
+    # Galichon writes the error term for alternative (leaf) j as
+    # $\sum_{t=1}^{n} path_coeff_up_to_t * log_positive_stable_draw(nest_coeff_t) + path_coeff_j leaf_gumbel_j$
+    # with nest_coeff_0 = 1.0
 
-    alt_order_array = np.asarray(alt_order_array)
-    leaf_gumbels = pd.DataFrame(
-        np.asarray(
-            state.get_rn_generator().gumbel_for_df(
-                alt_utilities, n=len(alt_order_array)
-            ),
-            dtype=EXACT_NESTED_LOGIT_DTYPE,
-        ),
-        index=alt_utilities.index,
-        columns=alt_utilities.columns.values,
-    )
-    # no this is broken now. Let's just write this out explicitly.
     error_terms = pd.DataFrame(
+        0.0,
         index=alt_utilities.index,
-        columns=alt_utilities.columns.values,
+        columns=alt_utilities.columns.to_numpy(),
         dtype=EXACT_NESTED_LOGIT_DTYPE,
     )
 
-    # TODO: len(nested_utilities) needs to be length of all nests, including root (used below and in positive_stable_draws due to recursion)
+    leaf_children_for_each_node = get_leaf_children_for_nodes(nest_spec)
 
-    def recurse(
-        node_spec: dict | LogitNestSpec,
-        path_coefficient: float,
-        parent_log_rate: np.ndarray,
-    ) -> None:
-        if isinstance(node_spec, LogitNestSpec):
-            node_spec = node_spec.model_dump(mode="python")
+    for i, nest in enumerate(each_nest(nest_spec, post_order=False)):
+        # skip root.
+        if i == 0:
+            assert np.isclose(
+                nest.coefficient, 1.0
+            ), "EET for nested logit requires root coefficient of 1.0"
+            continue
 
-        for child in node_spec["alternatives"]:
-            if isinstance(child, LogitNestSpec):
-                child = child.model_dump(mode="python")
+        if nest.type == "node":
+            all_leaf_children = leaf_children_for_each_node.get(nest.name, [])
+            if not all_leaf_children:
+                logger.warning(f"Node nest {nest.name} has no leaf children, skipping.")
+                continue
 
-            if isinstance(child, dict):
-                child_coefficient = child["coefficient"]
-                child_log_rate = (
-                    parent_log_rate / child_coefficient
-                    + _log_positive_stable_for_df(
-                        state, alt_utilities, child_coefficient
-                    )
-                )
-                recurse(
-                    child,
-                    path_coefficient * child_coefficient,
-                    child_log_rate,
-                )
-            else:
-                error_terms[child] = path_coefficient * (
-                    parent_log_rate + leaf_gumbels[child].to_numpy()
-                )
+            # draw stable term with nest coeff as scale and multiply by path coeff, add to each child alternative
+            log_stable_for_node = (
+                nest.product_of_coefficients
+                * _log_positive_stable_for_df(state, alt_utilities, nest.coefficient)
+            )
+            # all alternatives for a chooser (row) get the same term, so we repeat the values across columns
+            error_terms.loc[:, all_leaf_children] += log_stable_for_node.reshape(
+                -1, 1
+            ).repeat(len(all_leaf_children), axis=1)
 
-    recurse(
-        nest_spec,
-        root_nest.coefficient,
-        np.zeros(len(nested_utilities), dtype=EXACT_NESTED_LOGIT_DTYPE),
+    leaf_path_coefficients = _leaf_path_coefficients(
+        nest_spec, alt_utilities.columns.to_numpy()
     )
-    return error_terms.loc[:, alt_order_array]
+    leaf_gumbels = pd.DataFrame(
+        state.get_rn_generator().gumbel_for_df(alt_utilities, n=alt_utilities.shape[1]),
+        index=alt_utilities.index,
+        columns=alt_utilities.columns.to_numpy(),
+    ).mul(leaf_path_coefficients, axis=1)
+
+    error_terms += leaf_gumbels
+
+    return error_terms
 
 
 def make_choices_explicit_error_term_nl_exact_leaf(
@@ -568,7 +555,6 @@ def make_choices_explicit_error_term_nl_exact_leaf(
     trace_choosers=None,
     allow_bad_utils: bool = False,
 ) -> pd.Series:
-    alt_order_array = np.asarray(alt_order_array)
 
     utilities_incl_unobs = sample_nested_logit_exact_leaf_error_terms(
         state,
@@ -781,7 +767,6 @@ def make_choices_explicit_error_term_mnl(
 def make_choices_utility_based(
     state: workflow.State,
     utilities: pd.DataFrame,
-    name_mapping=None,
     nest_spec=None,
     trace_label: str = None,
     trace_choosers=None,
@@ -1191,3 +1176,19 @@ def group_nest_names_by_level(nest_spec):
     for n in each_nest(nest_spec):
         nest_levels[n.level].append(n.name)
     return nest_levels
+
+
+def get_leaf_children_for_nodes(nest_spec, include_self=False):
+    leaf_ancestors = {
+        nest.name: [ancestor for ancestor in nest.ancestors]
+        for nest in each_nest(nest_spec, type="leaf")
+    }
+
+    leaf_children_for_each_node = {}
+    for alt, ancestor_nodes in leaf_ancestors.items():
+        for ancestor in ancestor_nodes:
+            # skip the leaf itself unless include_self is True
+            if (ancestor != alt) or include_self:
+                leaf_children_for_each_node.setdefault(ancestor, list()).append(alt)
+
+    return leaf_children_for_each_node
