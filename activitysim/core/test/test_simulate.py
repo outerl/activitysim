@@ -225,6 +225,68 @@ def test_eval_nl_eet(state, nest_spec):
     assert np.allclose(mnl_counts, explicit_counts, atol=0.01)
 
 
+def test_eval_nl_eet_custom_chooser_uses_positional_contract(state, nest_spec):
+    num_choosers = 10
+
+    data2 = pd.DataFrame(
+        {"chooser_attr": np.linspace(0.1, 0.9, num_choosers)},
+        index=pd.Index(range(num_choosers), name="person_id"),
+    )
+    spec2 = pd.DataFrame(
+        {"alt1": [2.0], "alt0.0": [0.5], "alt0.1": [0.2]},
+        index=pd.Index(["chooser_attr"], name="Expression"),
+    )
+
+    captured = {}
+
+    def custom_chooser(custom_state, probs_or_utils, choosers, spec, trace_label):
+        captured["state"] = custom_state
+        captured["utilities"] = probs_or_utils.copy()
+        captured["choosers_index"] = choosers.index.copy()
+        captured["spec_columns"] = list(spec.columns)
+        captured["trace_label"] = trace_label
+
+        return (
+            pd.Series(
+                np.zeros(len(probs_or_utils), dtype=int), index=probs_or_utils.index
+            ),
+            pd.Series(
+                np.zeros(len(probs_or_utils), dtype=float), index=probs_or_utils.index
+            ),
+        )
+
+    state.settings.use_explicit_error_terms = True
+    state.settings.nested_explicit_error_term_method = "exact_leaf"
+    state.rng().set_base_seed(42)
+    state.rng().add_channel("person_id", data2)
+    state.rng().begin_step("test_step_custom_nl")
+
+    chunk_sizer = chunk.ChunkSizer(state, "", "", num_choosers)
+
+    try:
+        choices = simulate.eval_nl(
+            state=state,
+            choosers=data2,
+            spec=spec2,
+            nest_spec=nest_spec,
+            locals_d={},
+            custom_chooser=custom_chooser,
+            estimator=None,
+            trace_label="test",
+            chunk_sizer=chunk_sizer,
+        )
+    finally:
+        state.rng().end_step("test_step_custom_nl")
+
+    expected_choices = pd.Series(0, index=data2.index)
+    pdt.assert_series_equal(choices, expected_choices)
+    assert captured["state"] is state
+    pdt.assert_index_equal(captured["choosers_index"], data2.index)
+    assert captured["spec_columns"] == ["alt1", "alt0.0", "alt0.1"]
+    assert list(captured["utilities"].columns) == ["alt1", "alt0.0", "alt0.1"]
+    assert captured["trace_label"].endswith("eval_nl")
+
+
 def test_compute_nested_utilities(nest_spec):
     # computes nested utilities manually and using the function and checks that
     # the utilities are the same

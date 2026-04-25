@@ -585,17 +585,19 @@ def make_choices_explicit_error_term_nl_exact_leaf(
 
 
 def choose_from_tree(
-    nest_utils, all_alternatives, logit_nest_groups, nest_alternatives_by_name
+    nest_utils, root_alternatives, all_alternatives, nest_alternatives_by_name
 ):
-    for level, nest_names in logit_nest_groups.items():
-        if level == 1:
-            next_level_alts = nest_alternatives_by_name[nest_names[0]]
-            continue
-        choice_this_level = nest_utils[nest_utils.index.isin(next_level_alts)].idxmax()
+    next_level_alts = root_alternatives
+
+    while True:
+        current_level = nest_utils[nest_utils.index.isin(next_level_alts)]
+        if current_level.empty:
+            raise ValueError("This should never happen - no alternative found")
+
+        choice_this_level = current_level.idxmax()
         if choice_this_level in all_alternatives:
             return choice_this_level
         next_level_alts = nest_alternatives_by_name[choice_this_level]
-    raise ValueError("This should never happen - no alternative found")
 
 
 def make_choices_explicit_error_term_nl_tree_walk(
@@ -609,21 +611,21 @@ def make_choices_explicit_error_term_nl_tree_walk(
     alt_nrs_df: pd.DataFrame | None = None,
 ) -> pd.Series:
     """Walk down the nesting tree and make a choice at each level using EET."""
+    from activitysim.core.simulate import compute_nested_utilities
+
+    nested_utilities = compute_nested_utilities(alt_utilities, nest_spec)
+
     if trace_label:
         state.tracing.trace_df(
             nested_utilities, tracing.extend_trace_label(trace_label, "nested_utils")
         )
 
-    from activitysim.core.simulate import compute_nested_utilities
-
-    nested_utilities = compute_nested_utilities(alt_utilities, nest_spec)
-
     nest_utils_for_choice = add_ev1_random(
         state, nested_utilities, alts_context, alt_nrs_df
     )
 
+    root_nest = next(iter(each_nest(nest_spec, type="node", post_order=False)))
     all_alternatives = set(nest.name for nest in each_nest(nest_spec, type="leaf"))
-    logit_nest_groups = group_nest_names_by_level(nest_spec)
     nest_alternatives_by_name = {n.name: n.alternatives for n in each_nest(nest_spec)}
 
     # Apply is slow. It could *maybe* be sped up by using the fact that the nesting structure is the same for all rows:
@@ -633,7 +635,10 @@ def make_choices_explicit_error_term_nl_tree_walk(
     # each leaf's alternative list. Then pick the only alternative with entry 1, all others must be 0.
     choices = nest_utils_for_choice.apply(
         lambda x: choose_from_tree(
-            x, all_alternatives, logit_nest_groups, nest_alternatives_by_name
+            x,
+            root_nest.alternatives,
+            all_alternatives,
+            nest_alternatives_by_name,
         ),
         axis=1,
     )
@@ -823,8 +828,8 @@ def make_choices_utility_based(
             alt_nrs_df,
         )
     else:
-        # For nested models, choices are mapped to `name_mapping` ordering inside the
-        # EET helper because utilities contains node and leaf values.
+        # Nested-logit EET expects leaf utilities and returns indices aligned to
+        # the leaf alternative column order.
         choices = make_choices_explicit_error_term_nl(
             state,
             utilities,

@@ -1510,14 +1510,11 @@ def eval_nl(
         )
 
         if custom_chooser:
-            choices, rands = custom_chooser(
-                state,
-                utilities=raw_utilities,
-                choosers=choosers,
-                spec=spec,
-                nest_spec=nest_spec,
-                trace_label=trace_label,
-            )
+            # choices, rands = custom_chooser(
+            #     state, raw_utilities, choosers, spec, trace_label
+            # )
+            # TODO: implement, just need to change signature for CustomChooser_T for nested logit
+            raise NotImplementedError("Nested custom choosers for EET not implemented")
         else:
             choices, rands = logit.make_choices_utility_based(
                 state,
