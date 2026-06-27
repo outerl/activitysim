@@ -921,7 +921,12 @@ def create_pure_school_escort_tours(state: workflow.State, bundles):
         pe_tours["school_escort_direction"] == "inbound", "pure_escort", pd.NA
     )
 
-    pe_tours = pe_tours.sort_values(by=["household_id", "person_id", "start"])
+    # bundle_id (unique per row) is a deterministic final tiebreaker so that a
+    # chauffeur with two pure-escort tours sharing the same start time gets a
+    # reproducible ordering
+    pe_tours = pe_tours.sort_values(
+        by=["household_id", "person_id", "start", "bundle_id"]
+    )
 
     # finding what the next start time for that person for scheduling
     pe_tours["next_pure_escort_start"] = (

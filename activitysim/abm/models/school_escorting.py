@@ -85,13 +85,15 @@ def determine_escorting_participants(
     )
 
     chaperones["chaperone_num"] = (
-        chaperones.sort_values("chaperone_weight", ascending=False)
+        chaperones.sort_values(["chaperone_weight", "person_id"], ascending=[False, True])
         .groupby("household_id")
         .cumcount()
         + 1
     )
     escortees["escortee_num"] = (
-        escortees.sort_values("age", ascending=True).groupby("household_id").cumcount()
+        escortees.sort_values(["age", "person_id"], ascending=[True, True])
+        .groupby("household_id")
+        .cumcount()
         + 1
     )
 
@@ -278,9 +280,11 @@ def create_school_escorting_bundles_table(choosers, tours, stage):
     school_time_cols = [
         "time_home_to_school" + str(i) for i in range(1, NUM_ESCORTEES + 1)
     ]
-    bundles["outbound_order"] = list(bundles[school_time_cols].values.argsort() + 1)
+    bundles["outbound_order"] = list(
+        bundles[school_time_cols].values.argsort(kind="stable") + 1
+    )
     bundles["inbound_order"] = list(
-        (-1 * bundles[school_time_cols]).values.argsort() + 1
+        (-1 * bundles[school_time_cols]).values.argsort(kind="stable") + 1
     )  # inbound gets reverse order
     bundles["child_order"] = np.where(
         bundles["school_escort_direction"] == "outbound",
@@ -578,8 +582,8 @@ def school_escorting(
             + 1
         )
         escort_bundles.sort_values(
-            by=["household_id", "school_escort_direction"],
-            ascending=[True, False],
+            by=["household_id", "school_escort_direction", "bundle_id"],
+            ascending=[True, False, True],
             inplace=True,
         )
 
