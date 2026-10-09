@@ -4,7 +4,7 @@ import warnings
 from pathlib import Path
 from typing import Literal
 
-from pydantic import PositiveInt, root_validator
+from pydantic import AliasChoices, Field, PositiveInt, root_validator
 
 from activitysim.core.configuration.base import (
     Any,
@@ -152,7 +152,10 @@ class TAZ_Settings(PydanticBase):
     .. versionadded:: 1.2
     """
 
-    zarr_digital_encoding: list[DigitalEncoding] = None
+    zarr_digital_encoding: list[DigitalEncoding] = Field(
+        default=None,
+        validation_alias=AliasChoices("zarr_digital_encoding", "zarr-digital-encoding"),
+    )
     """
     A list of encodings to apply before saving skims in ZARR format.
 
