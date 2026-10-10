@@ -437,6 +437,11 @@ class Network_LOS(object):
         skim_setting = self.setting(f"{skim_tag}_skims")
         if isinstance(skim_setting, dict):
             return skim_setting.get("zarr-digital-encoding", None)
+        elif isinstance(skim_setting, TAZ_Settings):
+            return [
+                encoding.model_dump(exclude_unset=True)
+                for encoding in (skim_setting.zarr_digital_encoding or [])
+            ]
         else:
             return None
 

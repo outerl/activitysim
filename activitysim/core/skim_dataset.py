@@ -8,6 +8,7 @@ import time
 from functools import partial
 from pathlib import Path
 
+import dask
 import numpy as np
 import openmatrix
 import pandas as pd
@@ -1110,12 +1111,16 @@ def load_skim_dataset_to_shared_memory(state, skim_tag="taz") -> xr.Dataset:
                         "cannot cache skims to zarr"
                     )
                 else:
-                    if zarr_digital_encoding:
-                        d = _apply_digital_encoding(d, zarr_digital_encoding)
-                    logger.info(f"writing zarr skims to {zarr_file}")
-                    d.attrs["ZARR_WRITE_TIME"] = time.time()
-                    if not do_not_save_zarr:
-                        d.to_zarr_with_attr(zarr_file)
+                    # Encoding and writing can read lazy OMX arrays. PyTables
+                    # reads require synchronous scheduling rather than threads.
+                    with dask.config.set(scheduler="synchronous"):
+                        if zarr_digital_encoding:
+                            d = _apply_digital_encoding(d, zarr_digital_encoding)
+                        logger.info(f"writing zarr skims to {zarr_file}")
+                        d.attrs["ZARR_WRITE_TIME"] = time.time()
+                        if not do_not_save_zarr:
+                            # Preserve compatibility with existing caches.
+                            d.to_zarr_with_attr(zarr_file, zarr_format=2)
 
         if skim_tag in ("taz", "maz"):
             # load sparse MAZ skims, if any
@@ -1277,13 +1282,21 @@ def _finalize_skim_dataset(
                 f.close()
     else:
         logger.info("writing skims to shared memory")
-        if dask_required or any(is_parquet_file(f) for f in omx_file_paths):
+        if (
+            dask_required
+            or any(is_parquet_file(f) for f in omx_file_paths)
+            or d.digital_encoding.info()
+        ):
             # setting `load` to True uses dask to load the data into memory
             d = _apply_digital_encoding(d, skim_digital_encoding)
             # Parquet-backed datasets cannot use reload_from_omx_3d, so copy
             # their already-loaded data into shared memory. The same path is
             # required when coordinate realignment created a dask graph.
-            d_shared_mem = d.shm.to_shared_memory(backing, mode="r", load=True)
+            # Encoded arrays must be copied as stored: reloading raw OMX values
+            # would leave their encoding metadata attached to unencoded data.
+            d_shared_mem = d.shm.to_shared_memory(
+                backing, mode="r", load=True, dask_scheduler="synchronous"
+            )
         else:
             # setting `load` to false then calling `reload_from_omx_3d` avoids
             # using dask to load the data into memory, which is not performant
