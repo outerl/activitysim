@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import openmatrix as omx
 import pandas as pd
 
+from activitysim.abm.models.parking_location_choice import ParkingLocationSettings
 from activitysim.core import config, expressions, los, workflow
 from activitysim.core.configuration.base import PreprocessorSettings, PydanticReadable
 from activitysim.core.configuration.logit import LogitComponentSettings
-from activitysim.abm.models.parking_location_choice import ParkingLocationSettings
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +311,19 @@ def annotate_trips(
     return trips_df
 
 
+class _ODCells(NamedTuple):
+    """Matrix cells of the trips, for one pair of origin and destination columns."""
+
+    n_valid: int
+    """Number of trips with both an origin and a destination."""
+    rows: np.ndarray | None
+    """Positions of those trips that lie in the zone domain (None: all trips)."""
+    cells: np.ndarray
+    """Flat matrix cell of each of these trips: origin position * zones + destination position."""
+    mean_weight: np.ndarray | None
+    """Mean expansion weight of the trips in each cell; NaN where there are none or it is 0."""
+
+
 def write_matrices(
     state: workflow.State,
     trips_df: pd.DataFrame,
@@ -320,6 +333,11 @@ def write_matrices(
     """
     Write aggregated trips to OMX format per table using table-specific origin/destination
     columns and allow repeated table names to accumulate into the same matrix.
+
+    Zone positions, matrix cells and mean expansion weights depend only on a
+    table's origin and destination columns, which most tables share.  They are
+    computed once per pair of columns, so each table costs one pass over its
+    data column rather than a group-by over all trips.
     """
 
     matrix_settings = model_settings.MATRICES
@@ -340,6 +358,58 @@ def write_matrices(
     pos_index = pd.Index(pos_index, name=pos_index.name or "ZONE")
 
     hh_weight_col = model_settings.HH_EXPANSION_WEIGHT_COL
+    if hh_weight_col and hh_weight_col in trips_df.columns:
+        weights = trips_df[hh_weight_col]
+    else:
+        weights = None
+
+    domain_values: dict[str, pd.Series] = {}
+    od_cells: dict[tuple[str, str], _ODCells] = {}
+
+    def to_domain_vals(column: str) -> pd.Series:
+        # Map to zone domain if needed (TAZ/TAP domain is pos_index)
+        # if values are already in domain, keep; else try MAZ->TAZ mapping for TAZ outputs
+        if column not in domain_values:
+            series = trips_df[column]
+            domain_values[column] = series
+            if not series.isin(pos_index).all():
+                # try MAZ -> TAZ using land_use while preserving the original index
+                try:
+                    lu = state.get_dataframe("land_use")
+                    if "TAZ" in lu.columns:
+                        mapped = series.map(lu["TAZ"])
+                        # if mapping produced any non-nulls, use it
+                        if mapped.notna().any():
+                            domain_values[column] = mapped
+                except Exception:
+                    pass  # fallback; values not in domain are dropped below
+        return domain_values[column]
+
+    def cells_for(ocol: str, dcol: str) -> _ODCells:
+        if (ocol, dcol) not in od_cells:
+            o = to_domain_vals(ocol)
+            d = to_domain_vals(dcol)
+            # trips with both an origin and a destination ...
+            valid = (o.notna() & d.notna()).to_numpy()
+            oi = pos_index.get_indexer(o[valid])
+            di = pos_index.get_indexer(d[valid])
+            # ... of which those in the zone domain
+            inside = (oi != -1) & (di != -1)
+            rows = np.flatnonzero(valid)[inside]
+            cells = oi[inside].astype(np.int64) * n_zones + di[inside]
+            mean_weight = None
+            if weights is not None:
+                # use the average household weight for all trips in the cell
+                mean = weights.iloc[rows].groupby(cells).mean()
+                mean_weight = np.full(n_zones * n_zones, np.nan)
+                mean_weight[mean.index.to_numpy()] = mean.to_numpy()
+                mean_weight[mean_weight == 0] = np.nan
+            if len(rows) == len(trips_df):
+                rows = None
+            od_cells[(ocol, dcol)] = _ODCells(
+                int(valid.sum()), rows, cells, mean_weight
+            )
+        return od_cells[(ocol, dcol)]
 
     # For each output file, accumulate table_name -> matrix
     for matrix in matrix_settings:
@@ -373,71 +443,38 @@ def write_matrices(
                 )
                 continue
 
-            # Build a working frame with needed columns
-            work = trips_df[[ocol, dcol, col]].copy()
-            if hh_weight_col and hh_weight_col in trips_df.columns:
-                work[hh_weight_col] = trips_df[hh_weight_col]
-
-            # Map to zone domain if needed (TAZ/TAP domain is pos_index)
-            # if values are already in domain, keep; else try MAZ->TAZ mapping for TAZ outputs
-            def to_domain_vals(series: pd.Series) -> pd.Series:
-                # already in domain?
-                in_domain = pd.Series(series.isin(pos_index).values, index=series.index)
-                if in_domain.all():
-                    return series
-                # try MAZ -> TAZ using land_use while preserving the original index
-                try:
-                    lu = state.get_dataframe("land_use")
-                    if "TAZ" in lu.columns:
-                        mapped = series.map(lu["TAZ"])
-                        # if mapping produced any non-nulls, use it
-                        if mapped.notna().any():
-                            return mapped
-                except Exception:
-                    pass
-                return series  # fallback; may drop later if not in domain
-
-            work["_o"] = to_domain_vals(work[ocol])
-            work["_d"] = to_domain_vals(work[dcol])
-
-            # Drop rows with either missing origin/destination
-            work = work.dropna(subset=["_o", "_d"])
-
-            # Aggregate by OD
-            if hh_weight_col and hh_weight_col in work.columns:
-                grouped_sum = work.groupby(["_o", "_d"], sort=False)[col].sum()
-                mean_w = work.groupby(["_o", "_d"], sort=False)[hh_weight_col].mean()
-                vals = (grouped_sum / mean_w.replace(0, np.nan)).fillna(0.0)
-            else:
-                vals = work.groupby(["_o", "_d"], sort=False)[col].sum()
-
-            if vals.empty:
+            od = cells_for(ocol, dcol)
+            if od.n_valid == 0:
                 continue
-
-            # Map OD labels to positional indices
-            o_vals = vals.index.get_level_values(0)
-            d_vals = vals.index.get_level_values(1)
-
-            oi = pos_index.get_indexer(o_vals)
-            di = pos_index.get_indexer(d_vals)
-
-            mask = (oi != -1) & (di != -1)
-            if not np.any(mask):
+            if len(od.cells) == 0:
                 logger.warning(
                     f"No valid OD pairs for table {table_name} in domain; skipping."
                 )
                 continue
 
-            oi = oi[mask]
-            di = di[mask]
-            v = vals.to_numpy()[mask]
+            # Aggregate by OD
+            values = trips_df[col] if od.rows is None else trips_df[col].iloc[od.rows]
+            if isinstance(values.dtype, np.dtype) and values.dtype.kind in "biu":
+                # sums of booleans and integers are exact in float64
+                v = np.bincount(
+                    od.cells, weights=values.to_numpy(), minlength=n_zones * n_zones
+                )
+            else:
+                # other types as a group-by, which skips missing values and
+                # sums floats with compensation
+                grouped = values.groupby(od.cells).sum()
+                v = np.zeros(n_zones * n_zones)
+                v[grouped.index.to_numpy()] = grouped.to_numpy(dtype=float)
+            if od.mean_weight is not None:
+                v = v / od.mean_weight
+                v[np.isnan(v)] = 0.0
 
             # Accumulate into dataset matrix
             data = datasets.get(table_name)
             if data is None:
                 data = np.zeros((n_zones, n_zones), dtype=float)
                 datasets[table_name] = data
-            data[oi, di] += v
+            data += v.reshape(n_zones, n_zones)
 
             logger.debug(f"accumulated {table_name} sum {v.sum():0.2f}")
 
