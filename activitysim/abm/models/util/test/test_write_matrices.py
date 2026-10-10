@@ -344,7 +344,7 @@ def _write_one_table(trips_df, omx_name):
         return {name: f[name][:] for name in f.list_matrices()}
 
 
-@pytest.mark.parametrize("dtype", [np.float32, "Float32"])
+@pytest.mark.parametrize("dtype", [np.float32, "Float32", np.int8, np.int16, np.uint8, np.uint16])
 def test_write_matrices_keeps_float32_arithmetic(dtype):
     # the group-by divides float32 sums by float32 means in float32: 3 / 0.3 = 10
     trips_df = pd.DataFrame(
@@ -352,7 +352,9 @@ def test_write_matrices_keeps_float32_arithmetic(dtype):
             "origin": [1, 1, 1],
             "destination": [2, 2, 2],
             "x": pd.array([1, 1, 1], dtype=dtype),
-            "sample_rate": pd.array([0.3, 0.3, 0.3], dtype=dtype),
+            "sample_rate": pd.array(
+                [0.3, 0.3, 0.3], dtype="Float32" if dtype == "Float32" else np.float32
+            ),
         }
     )
     data = _write_one_table(trips_df, "trips_float32.omx")["X"]
@@ -388,3 +390,17 @@ def test_write_matrices_categorical_zones_without_trips():
     matrices = _write_one_table(trips_df, "trips_categorical.omx")
     assert list(matrices) == ["X"]
     assert not matrices["X"].any()
+
+
+def test_write_matrices_keeps_integer_promotion_from_outside_domain():
+    # The outside group forces int8 sums to int64 before Float32 division.
+    trips_df = pd.DataFrame(
+        {
+            "origin": [1, 1, 1, -1, -1],
+            "destination": [2, 2, 2, 2, 2],
+            "x": np.array([1, 1, 1, 127, 127], dtype=np.int8),
+            "sample_rate": pd.array([0.3] * 5, dtype="Float32"),
+        }
+    )
+    data = _write_one_table(trips_df, "trips_integer_promotion.omx")["X"]
+    assert data[0, 1] == 3 / float(np.float32(0.3))
