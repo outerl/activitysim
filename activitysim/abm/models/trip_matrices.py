@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -314,14 +315,26 @@ def annotate_trips(
 class _ODCells(NamedTuple):
     """Matrix cells of the trips, for one pair of origin and destination columns."""
 
-    n_valid: int
-    """Number of trips with both an origin and a destination."""
+    has_groups: bool
+    """Whether a group-by of the trips on these columns forms any group."""
+    has_groups_in_domain: bool
+    """Whether any of those groups lies in the zone domain."""
     rows: np.ndarray | None
-    """Positions of those trips that lie in the zone domain (None: all trips)."""
+    """Positions of the trips with an origin and destination in the domain (None: all)."""
     cells: np.ndarray
     """Flat matrix cell of each of these trips: origin position * zones + destination position."""
-    mean_weight: np.ndarray | None
-    """Mean expansion weight of the trips in each cell; NaN where there are none or it is 0."""
+    mean_weight: pd.Series | None
+    """Mean expansion weight of the trips in each cell, indexed by cell."""
+
+
+def _exact_in_float64(values: pd.Series) -> bool:
+    """Whether every partial sum of these values is an integer below 2**53."""
+    if not isinstance(values.dtype, np.dtype) or values.dtype.kind not in "biu":
+        return False
+    if values.dtype.kind == "b" or len(values) == 0:
+        return True
+    largest = max(abs(int(values.min())), abs(int(values.max())))
+    return largest * len(values) < 2**53
 
 
 def write_matrices(
@@ -337,7 +350,9 @@ def write_matrices(
     Zone positions, matrix cells and mean expansion weights depend only on a
     table's origin and destination columns, which most tables share.  They are
     computed once per pair of columns, so each table costs one pass over its
-    data column rather than a group-by over all trips.
+    data column rather than a group-by over all trips.  Results are those of a
+    group-by per table: boolean and integer fields that sum exactly in float64
+    are counted with `np.bincount`, everything else is aggregated by pandas.
     """
 
     matrix_settings = model_settings.MATRICES
@@ -397,19 +412,44 @@ def write_matrices(
             inside = (oi != -1) & (di != -1)
             rows = np.flatnonzero(valid)[inside]
             cells = oi[inside].astype(np.int64) * n_zones + di[inside]
+            has_groups, has_groups_in_domain = bool(valid.any()), len(cells) > 0
+            if isinstance(o.dtype, pd.CategoricalDtype) or isinstance(
+                d.dtype, pd.CategoricalDtype
+            ):
+                # a group-by on categoricals also forms groups for unobserved
+                # categories (observed=False), which give zero matrices
+                pairs = pd.DataFrame({"_o": o[valid], "_d": d[valid]}).drop_duplicates()
+                keys = pairs.groupby(["_o", "_d"], sort=False).size().index
+                has_groups = len(keys) > 0
+                has_groups_in_domain = bool(
+                    np.any(
+                        (pos_index.get_indexer(keys.get_level_values(0)) != -1)
+                        & (pos_index.get_indexer(keys.get_level_values(1)) != -1)
+                    )
+                )
             mean_weight = None
-            if weights is not None:
+            if weights is not None and len(cells):
                 # use the average household weight for all trips in the cell
-                mean = weights.iloc[rows].groupby(cells).mean()
-                mean_weight = np.full(n_zones * n_zones, np.nan)
-                mean_weight[mean.index.to_numpy()] = mean.to_numpy()
-                mean_weight[mean_weight == 0] = np.nan
+                mean_weight = weights.iloc[rows].groupby(cells).mean()
             if len(rows) == len(trips_df):
                 rows = None
             od_cells[(ocol, dcol)] = _ODCells(
-                int(valid.sum()), rows, cells, mean_weight
+                has_groups, has_groups_in_domain, rows, cells, mean_weight
             )
         return od_cells[(ocol, dcol)]
+
+    # each column pair's cells are released after the last table that uses them
+    uses = Counter(
+        (table.origin or "origin", table.destination or "destination")
+        for matrix in matrix_settings
+        for table in matrix.tables
+        if {
+            table.data_field,
+            table.origin or "origin",
+            table.destination or "destination",
+        }
+        <= set(trips_df.columns)
+    )
 
     # For each output file, accumulate table_name -> matrix
     for matrix in matrix_settings:
@@ -444,9 +484,12 @@ def write_matrices(
                 continue
 
             od = cells_for(ocol, dcol)
-            if od.n_valid == 0:
+            uses[(ocol, dcol)] -= 1
+            if uses[(ocol, dcol)] == 0:
+                del od_cells[(ocol, dcol)]
+            if not od.has_groups:
                 continue
-            if len(od.cells) == 0:
+            if not od.has_groups_in_domain:
                 logger.warning(
                     f"No valid OD pairs for table {table_name} in domain; skipping."
                 )
@@ -454,27 +497,35 @@ def write_matrices(
 
             # Aggregate by OD
             values = trips_df[col] if od.rows is None else trips_df[col].iloc[od.rows]
-            if isinstance(values.dtype, np.dtype) and values.dtype.kind in "biu":
-                # sums of booleans and integers are exact in float64
+            mean_w = od.mean_weight
+            if _exact_in_float64(values) and (
+                mean_w is None
+                or (isinstance(mean_w.dtype, np.dtype) and mean_w.dtype.kind == "f")
+            ):
+                # counts and integer sums are exact in float64, and so is their
+                # division by the mean weight, as in the group-by
                 v = np.bincount(
                     od.cells, weights=values.to_numpy(), minlength=n_zones * n_zones
                 )
+                cells = slice(None)
+                if mean_w is not None:
+                    cells = mean_w.index.to_numpy()
+                    v = v[cells] / mean_w.replace(0, np.nan).to_numpy()
+                    v[np.isnan(v)] = 0.0
             else:
-                # other types as a group-by, which skips missing values and
-                # sums floats with compensation
-                grouped = values.groupby(od.cells).sum()
-                v = np.zeros(n_zones * n_zones)
-                v[grouped.index.to_numpy()] = grouped.to_numpy(dtype=float)
-            if od.mean_weight is not None:
-                v = v / od.mean_weight
-                v[np.isnan(v)] = 0.0
+                # other types as the group-by did, which keeps their dtype,
+                # skips missing values and sums floats with compensation
+                vals = values.groupby(od.cells).sum()
+                if mean_w is not None:
+                    vals = (vals / mean_w.replace(0, np.nan)).fillna(0.0)
+                cells, v = vals.index.to_numpy(), vals.to_numpy()
 
             # Accumulate into dataset matrix
             data = datasets.get(table_name)
             if data is None:
                 data = np.zeros((n_zones, n_zones), dtype=float)
                 datasets[table_name] = data
-            data += v.reshape(n_zones, n_zones)
+            data.reshape(-1)[cells] += v
 
             logger.debug(f"accumulated {table_name} sum {v.sum():0.2f}")
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import openmatrix as omx
 import pandas as pd
+import pytest
 
 from activitysim.abm.models.trip_matrices import (
     MatrixSettings,
@@ -319,3 +320,71 @@ def test_write_matrices_matches_per_table_groupby_two_zone():
     _assert_matches_reference(
         state, trips_df, zone_index, "trips_random_two.omx", land_use
     )
+
+
+def _write_one_table(trips_df, omx_name):
+    """Matrices written for a single table 'X' aggregating column 'x' over zones 1-2."""
+    state = workflow.State.make_default(__file__)
+    settings = WriteTripMatricesSettings(
+        MATRICES=[
+            MatrixSettings(
+                file_name=Path(omx_name),
+                tables=[MatrixTableSettings(name="X", data_field="x")],
+            )
+        ]
+    )
+    write_matrices(
+        state=state,
+        trips_df=trips_df,
+        zone_index=pd.Index([1, 2], name="TAZ"),
+        model_settings=settings,
+    )
+    omx_path = os.path.join(os.path.dirname(__file__), "output", omx_name)
+    with omx.open_file(omx_path, mode="r") as f:
+        return {name: f[name][:] for name in f.list_matrices()}
+
+
+@pytest.mark.parametrize("dtype", [np.float32, "Float32"])
+def test_write_matrices_keeps_float32_arithmetic(dtype):
+    # the group-by divides float32 sums by float32 means in float32: 3 / 0.3 = 10
+    trips_df = pd.DataFrame(
+        {
+            "origin": [1, 1, 1],
+            "destination": [2, 2, 2],
+            "x": pd.array([1, 1, 1], dtype=dtype),
+            "sample_rate": pd.array([0.3, 0.3, 0.3], dtype=dtype),
+        }
+    )
+    data = _write_one_table(trips_df, "trips_float32.omx")["X"]
+    assert data[0, 1] == 10.0
+
+
+def test_write_matrices_sums_large_integers_exactly():
+    # partial sums beyond 2**53 are not exact in float64
+    trips_df = pd.DataFrame(
+        {
+            "origin": [1, 1, 1],
+            "destination": [2, 2, 2],
+            "x": np.array([2**53, 1, -(2**53)], dtype=np.int64),
+            "sample_rate": [1.0, 1.0, 1.0],
+        }
+    )
+    data = _write_one_table(trips_df, "trips_large_int.omx")["X"]
+    assert data[0, 1] == 1.0
+
+
+def test_write_matrices_categorical_zones_without_trips():
+    # a group-by on categorical zones forms groups for unused categories too,
+    # so the matrix is written (as zeros) even when no trip has both zones
+    zones = pd.CategoricalDtype([1, 2])
+    trips_df = pd.DataFrame(
+        {
+            "origin": pd.Categorical([np.nan, np.nan], dtype=zones),
+            "destination": pd.Categorical([1, 2], dtype=zones),
+            "x": [1, 1],
+            "sample_rate": [1.0, 1.0],
+        }
+    )
+    matrices = _write_one_table(trips_df, "trips_categorical.omx")
+    assert list(matrices) == ["X"]
+    assert not matrices["X"].any()
